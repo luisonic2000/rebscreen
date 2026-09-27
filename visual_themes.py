@@ -4,7 +4,6 @@ from __future__ import annotations
 from copy import deepcopy
 
 
-THEME_STANDARD = "Padrão"
 THEME_TECHNICAL = "Painel Técnico"
 THEME_REBEL = "Rebel"
 
@@ -36,14 +35,12 @@ REBEL_HORIZONTAL = {
 }
 
 
-def available_themes() -> tuple[str, str, str]:
-    return THEME_STANDARD, THEME_TECHNICAL, THEME_REBEL
+def available_themes() -> tuple[str, str]:
+    return THEME_REBEL, THEME_TECHNICAL
 
 
 def layout_templates(name: str, defaults: dict) -> dict[str, dict]:
     """Return independent portrait/landscape profiles for an explicit apply."""
-    if name != THEME_TECHNICAL:
-        if name == THEME_REBEL:
-            return {"vertical": deepcopy(REBEL_PORTRAIT), "horizontal": deepcopy(REBEL_HORIZONTAL)}
-        return {"vertical": deepcopy(defaults), "horizontal": deepcopy(defaults)}
-    return {"vertical": deepcopy(TECHNICAL_PORTRAIT), "horizontal": deepcopy(TECHNICAL_HORIZONTAL)}
+    if name == THEME_TECHNICAL:
+        return {"vertical": deepcopy(TECHNICAL_PORTRAIT), "horizontal": deepcopy(TECHNICAL_HORIZONTAL)}
+    return {"vertical": deepcopy(REBEL_PORTRAIT), "horizontal": deepcopy(REBEL_HORIZONTAL)}
