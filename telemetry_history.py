@@ -10,6 +10,12 @@ def rate_label(value: float) -> str:
         value /= 1024
 
 
-def aggregate_point(cpu: int, gpu: int, ram: int, temperatures: list[int | None]) -> dict:
+def aggregate_point(cpu: int, gpu: int, ram: int, temperatures: list[int | None], disk_temperatures: list[int | None] | None = None) -> dict:
+    """Keep system and disk thermal averages separate; missing sensors stay missing."""
     available = [value for value in temperatures if isinstance(value, (int, float))]
-    return {"usage": round((cpu + gpu + ram) / 3), "temperature": round(sum(available) / len(available)) if available else None}
+    disk_available = [value for value in (disk_temperatures or []) if isinstance(value, (int, float))]
+    return {
+        "usage": round((cpu + gpu + ram) / 3),
+        "temperature": round(sum(available) / len(available)) if available else None,
+        "disk_temperature": round(sum(disk_available) / len(disk_available)) if disk_available else None,
+    }

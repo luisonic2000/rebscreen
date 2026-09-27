@@ -6,7 +6,7 @@ TuringScreenTransport to move from this prototype to live hardware.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from itertools import cycle
 from io import BytesIO
 from pathlib import Path
@@ -33,13 +33,15 @@ from brightness_protocol import HARDWARE_BRIGHTNESS_SUPPORTED, brightness_status
 from rotation import next_enabled_page, rotation_due
 from telemetry_mapping import disk_label, normalize_disks
 from single_instance import SingleInstance
-from visual_themes import THEME_STANDARD, THEME_TECHNICAL, THEME_REBEL, available_themes, layout_templates
+from visual_themes import THEME_TECHNICAL, THEME_REBEL, available_themes, layout_templates
 from rebscreen_identity import APP_NAME, header_state
 from source_icons import draw_source_icon
 from lhm_telemetry import disk_rows, query_lhm
+from disk_inventory import query_disk_inventory
 from network_telemetry import NetworkRates
 from telemetry_history import aggregate_point, rate_label
 from layout_colors import reset_item_colors, set_item_color
+from process_telemetry import ProcessSampler, ProcessRow
 
 
 RESOURCE_DIR = Path(getattr(sys, "_MEIPASS", Path(__file__).parent))
@@ -64,7 +66,7 @@ class SettingsStore:
     default = {"dark": True, "accent": "#5b8cff", "custom_fonts": True, "font_scale": 1.0,
                "auto_switch_media": False, "auto_send": True, "send_interval": 1.0, "port": "COM3", "orientation": "vertical",
                "geometry": "1180x760", "rotation_enabled": False, "rotation_interval": 10.0,
-               "rotation_pages": [True, True], "preview_brightness": 100, "monitor_style": "cards", "visual_theme": THEME_REBEL}
+               "rotation_pages": [True, True, True], "preview_brightness": 100, "monitor_style": "cards", "visual_theme": THEME_REBEL}
     def __init__(self) -> None:
         self.data = dict(self.default)
         try:
@@ -95,6 +97,10 @@ class Disk:
     name: str
     temperature: int | None
     health: str
+    units: list[str] = field(default_factory=list)
+    usage: int | None = None
+    usage_history: list[int] = field(default_factory=list)
+    temperature_history: list[int | None] = field(default_factory=list)
 
 
 @dataclass
@@ -430,14 +436,39 @@ class DemoMetricsProvider:
     """Local usage plus all mounted Windows volumes; sensor gaps remain visible."""
     def __init__(self):
         self.sensor_status = "Sensores de disco: verificando Libre Hardware Monitor…"
+        self._inventory: list[dict] = []
+        self._disk_history: dict[str, dict[str, list]] = {}
+        self._sensor_snapshot: list[dict] = []
+        self._sensor_checked_at = 0.0
 
     def disks(self) -> list[Disk]:
         if os.name != "nt":
             return [Disk("Armazenamento local", None, "Sensor de saúde indisponível")]
-        mask = ctypes.windll.kernel32.GetLogicalDrives()
-        volumes = [f"Volume {chr(letter)}:" for letter in range(26) if mask & (1 << letter)]
-        sensors, self.sensor_status = query_lhm()
-        return [Disk(item["name"], item["temperature"], item["health"]) for item in disk_rows(sensors, volumes)]
+        if not self._inventory:
+            self._inventory = query_disk_inventory()
+        volumes = [item["name"] for item in self._inventory]
+        # Starting a sensor bridge or querying a local HTTP server is much
+        # more expensive than drawing a frame. Reuse its result briefly so
+        # the Tk event loop stays responsive while the display still updates.
+        now = time.monotonic()
+        if now - self._sensor_checked_at >= 5.0:
+            self._sensor_snapshot, self.sensor_status = query_lhm()
+            self._sensor_checked_at = now
+        sensors = self._sensor_snapshot
+        sensor_by_name = {item["name"].casefold(): item for item in disk_rows(sensors, volumes)}
+        disks = []
+        for item in self._inventory[:6]:
+            sensor = sensor_by_name.get(item["name"].casefold(), {})
+            key = item["name"].casefold()
+            history = self._disk_history.setdefault(key, {"usage": [], "temperature": []})
+            usage = item.get("usage")
+            temperature = sensor.get("temperature")
+            history["usage"] = (history["usage"] + [usage if usage is not None else 0])[-30:]
+            history["temperature"] = (history["temperature"] + [temperature])[-30:]
+            disks.append(Disk(item["name"], temperature, sensor.get("health", "Indisponível"), item.get("units", []), usage, history["usage"], history["temperature"]))
+        if disks:
+            return disks
+        return [Disk(item["name"], item["temperature"], item["health"]) for item in disk_rows(sensors, volumes)[:6]]
     def read(self) -> Metrics:
         return Metrics(
             cpu_usage=random.randint(18, 76), cpu_temperature=random.randint(46, 89),
@@ -580,7 +611,7 @@ DARK = {"bg": "#10151f", "card": "#1b2330", "text": "#f3f6fb", "muted": "#aeb8c8
 
 class PanelFrameRenderer:
     """The single 320×480 renderer used by both preview and physical display."""
-    def __init__(self, theme: dict[str, str], accent: str, use_custom_fonts: bool, font_scale: float = 1.0, layout: dict | None = None, monitor_style: str = "cards", visual_theme: str = THEME_STANDARD) -> None:
+    def __init__(self, theme: dict[str, str], accent: str, use_custom_fonts: bool, font_scale: float = 1.0, layout: dict | None = None, monitor_style: str = "cards", visual_theme: str = THEME_REBEL) -> None:
         from PIL import Image, ImageDraw, ImageFont
         self.Image = Image
         self.Draw = ImageDraw
@@ -604,7 +635,7 @@ class PanelFrameRenderer:
     def time_label(value: int) -> str:
         return f"{value // 60}:{value % 60:02d}"
 
-    def render(self, page: int, metrics: Metrics, track: Track, *args, history: list[int] | None = None, network: tuple[float, float] = (0.0, 0.0)) -> object:
+    def render(self, page: int, metrics: Metrics, track: Track, *args, history: list[int] | None = None, network: tuple[float, float] = (0.0, 0.0), processes: list[ProcessRow] | None = None) -> object:
         """Render current UI; accepts the retired lyrics argument from old callers."""
         if len(args) == 4:  # legacy: lyrics, alert, label, art
             _, alert, media_label, album_art = args
@@ -617,6 +648,8 @@ class PanelFrameRenderer:
             image.paste("#101315", (0, 0, 320, 480))
             if page == 0:
                 self._technical_monitor(draw, metrics, history or [])
+            elif page == 2:
+                self._processes(draw, processes or [], technical=True)
             else:
                 self._technical_player(draw, track, media_label, album_art)
             return image
@@ -624,17 +657,41 @@ class PanelFrameRenderer:
             image.paste("#16191a", (0, 0, 320, 480))
             if page == 0:
                 self._rebel_monitor(draw, metrics, history or [], alert, network)
+            elif page == 2:
+                self._processes(draw, processes or [], technical=False)
             else:
                 self._rebel_player(draw, track, media_label, album_art)
             return image
         if page == 0:
             self._monitor(draw, metrics, history or [])
+        elif page == 2:
+            self._processes(draw, processes or [], technical=False)
         else:
             self._spotify(draw, track, media_label, album_art)
         if alert:
             draw.rectangle((0, 446, 319, 479), fill="#ef5350")
             self.text(draw, (160, 463), alert, "metric", 9, "#111111", "mm")
         return image
+
+    def _processes(self, draw, processes: list[ProcessRow], technical: bool = False) -> None:
+        cyan, cream, muted = self._rebel_frame(draw, "PROCESSOS") if not technical else ("#52c7d8", "#e5edf6", "#8493a5")
+        if technical:
+            self.text(draw, (18, 18), "REBSCREEN // PROCESSOS", "aux", 10, cream)
+            draw.line((18, 48, 302, 48), fill=cyan)
+        self.text(draw, (20, 62), "TOP 10 // MÉDIA: CPU   RAM   DISCO   REDE", "aux", 8, cyan)
+        if not processes:
+            self.text(draw, (160, 230), "COLETANDO PROCESSOS…", "aux", 11, muted, "mm")
+            return
+        for index, row in enumerate(processes[:10]):
+            y = 83 + index * 35
+            draw.rectangle((18, y, 302, y + 29), fill="#202829" if not technical else "#182126", outline="#36484b")
+            self.text(draw, (25, y + 8), row.name[:17], "aux", 9, cream)
+            self.text(draw, (181, y + 8), f"{row.cpu:.0f}%", "aux", 8, cyan, "ra")
+            self.text(draw, (221, y + 8), f"{row.memory_percent:.0f}%", "aux", 8, cream, "ra")
+            self.text(draw, (260, y + 8), f"{row.disk_percent:.0f}%", "aux", 8, cream, "ra")
+            network = "—" if row.network_kbps is None else (f"{row.network_kbps / 1024:.1f}M" if row.network_kbps >= 1024 else f"{row.network_kbps:.0f}K")
+            self.text(draw, (296, y + 8), network, "aux", 8, muted, "ra")
+        self.text(draw, (20, 445), "ORDEM: MÉDIA CPU / RAM / DISCO / REDE", "aux", 8, muted)
 
     def _rebel_frame(self, draw, title: str):
         cyan, cream, muted = "#73aeb1", "#f2d98a", "#718082"
@@ -666,25 +723,67 @@ class PanelFrameRenderer:
         self.text(draw, (100,170), f"{metrics.ram_usage}%", "metric", 23, cream)
         self.text(draw, (286,178), "EM USO", "aux", 8, muted, "ra")
         self._segmented(draw, 31, 202, 255, metrics.ram_usage, "#d5a94c")
-        self.text(draw, (20,232), "DISCOS // UNIDADE       SAÚDE       TEMP.", "aux", 9, cyan)
-        for index, disk in enumerate(metrics.disks[:3]):
-            y=252+index*25; draw.line((20,y-4,300,y-4), fill="#354244")
-            self.text(draw,(25,y),disk.name[:17],"aux",10,cream)
-            self.text(draw,(212,y),disk.health[:10],"aux",8,"#80ba82" if disk.temperature is not None else muted)
-            self.text(draw,(292,y),f"{disk.temperature}°" if disk.temperature is not None else "—","aux",9,cream,"ra")
+        self.text(draw, (20,232), "DISCOS // USO (CIANO) + TEMPERATURA (CREME)", "aux", 8, cyan)
+        self._disk_blocks(draw, metrics.disks[:6], 20, 246, 300, 326, cyan, cream, muted)
         points=(history or [{"usage": metrics.cpu_usage, "temperature": None}])[-30:]
-        if not isinstance(points[0], dict): points=[{"usage": value, "temperature": None} for value in points]
+        if not isinstance(points[0], dict): points=[{"usage": value, "temperature": None, "disk_temperature": None} for value in points]
         points=points*2 if len(points)==1 else points
         draw.rectangle((20,337,300,420), outline="#3c5557")
         draw.line([(20+i*280/(len(points)-1),412-max(0,min(100,p["usage"]))*62/100) for i,p in enumerate(points)], fill=cyan, width=2)
         temps=[p["temperature"] for p in points]
         if any(value is not None for value in temps):
             draw.line([(20+i*280/(len(points)-1),412-max(0,min(100,p["temperature"] or 0))*62/100) for i,p in enumerate(points)], fill="#f2d98a", width=2)
-        self.text(draw,(24,342),"USO % (CIANO) / TEMP °C (CREME)","aux",7,muted)
+        disk_temps=[p.get("disk_temperature") for p in points]
+        if any(value is not None for value in disk_temps):
+            draw.line([(20+i*280/(len(points)-1),412-max(0,min(100,p.get("disk_temperature") or 0))*62/100) for i,p in enumerate(points)], fill="#d98ad5", width=1)
+        self.text(draw,(24,342),"USO / TEMP SISTEMA / TEMP DISCOS", "aux",7,muted)
         self.text(draw,(22,426),"Sinal " + rate_label(network[0]), "aux",9,"#80ba82")
         self.text(draw,(150,426),"Link " + rate_label(network[1]), "aux",9,"#d5a94c")
         draw.rectangle((20,444,300,460), fill="#572f32" if alert else "#293032")
         self.text(draw,(28,447), alert[:40] if alert else "SISTEMA ESTÁVEL // ALERTAS EM ESPERA", "aux",8,"#f0abb0" if alert else muted)
+
+    def _disk_blocks(self, draw, disks: list[Disk], left: int, top: int, right: int, bottom: int, cyan: str, cream: str, muted: str) -> None:
+        """Draw one adaptive, self-contained history card for each physical disk."""
+        disks = disks[:6]
+        if not disks:
+            self.text(draw, ((left + right) // 2, (top + bottom) // 2), "NENHUM DISCO DETECTADO", "aux", 9, muted, "mm")
+            return
+        count = len(disks)
+        columns = 1 if count == 1 else 2 if count in (2, 4) else 3
+        rows = 1 if count <= 3 else 2
+        gap = 4
+        width = (right - left - gap * (columns - 1)) // columns
+        height = (bottom - top - gap * (rows - 1)) // rows
+        for index, disk in enumerate(disks):
+            col, row = index % columns, index // columns
+            x, y = left + col * (width + gap), top + row * (height + gap)
+            draw.rectangle((x, y, x + width, y + height), fill="#202829", outline="#465b5d")
+            font = 8 if columns == 1 else 7 if columns == 2 else 6
+            name = disk.name[:20 if columns == 1 else 12 if columns == 2 else 9]
+            unit = ",".join(disk.units) if disk.units else "SEM UNIDADE"
+            usage = f"{disk.usage}%" if disk.usage is not None else "—"
+            temp = f"{disk.temperature}°" if disk.temperature is not None else "—"
+            # Labels sit on the card's solid upper band, so graphs never make
+            # the drive name, letter or usage hard to read.
+            self.text(draw, (x + 4, y + 3), name, "aux", font, cream)
+            self.text(draw, (x + width - 4, y + 3), usage, "aux", font, cyan, "ra")
+            self.text(draw, (x + 4, y + 12), unit, "aux", max(5, font - 1), muted)
+            self.text(draw, (x + width - 4, y + 12), temp, "aux", max(5, font - 1), cream, "ra")
+            graph_top, graph_bottom = y + min(23, height - 10), y + height - 4
+            usage_history = disk.usage_history or ([disk.usage] if disk.usage is not None else [0])
+            temp_history = disk.temperature_history or ([disk.temperature] if disk.temperature is not None else [])
+            if len(usage_history) == 1:
+                usage_history = usage_history * 2
+            if graph_bottom > graph_top:
+                points = [(x + 3 + i * (width - 6) / (len(usage_history) - 1), graph_bottom - max(0, min(100, value or 0)) * (graph_bottom - graph_top) / 100) for i, value in enumerate(usage_history)]
+                draw.line(points, fill=cyan, width=1)
+                usable_temps = [value for value in temp_history if value is not None]
+                if len(usable_temps) >= 2:
+                    values = temp_history[-len(usage_history):]
+                    if len(values) == 1:
+                        values *= 2
+                    temp_points = [(x + 3 + i * (width - 6) / (len(values) - 1), graph_bottom - max(0, min(100, value or 0)) * (graph_bottom - graph_top) / 100) for i, value in enumerate(values)]
+                    draw.line(temp_points, fill=cream, width=1)
 
     def _rebel_player(self, draw, track: Track, media_label: str, album_art=None) -> None:
         cyan, cream, muted = self._rebel_frame(draw, "NOW PLAYING")
@@ -730,6 +829,7 @@ class PanelFrameRenderer:
         draw.rounded_rectangle((left, top, right, bottom), radius=8, outline="#2e5155", width=1)
         self.text(draw, (left, 280), "CPU // ÚLTIMOS 60 SEGUNDOS", "aux", 10, cyan)
         values = (history or [metrics.cpu_usage])[-60:]
+        values = [value.get("usage", metrics.cpu_usage) if isinstance(value, dict) else value for value in values]
         if len(values) == 1: values = values * 2
         points = [(left + i * (right-left)/(len(values)-1), bottom-12-max(0,min(100,v))*(bottom-top-24)/100) for i,v in enumerate(values)]
         draw.line(points, fill=cyan, width=3)
@@ -872,6 +972,8 @@ class PanelApp(tk.Tk):
         self.spotify_provider = SpotifyDemoProvider()
         self.media_provider = WindowsMediaProvider()
         self.layout_store = LayoutStore()
+        self.process_sampler = ProcessSampler()
+        self.processes: list[ProcessRow] = self.process_sampler.read()
         self.page = 0
         self.dark = bool(self.settings.data["dark"])
         self.accent = self.settings.data["accent"]
@@ -895,7 +997,9 @@ class PanelApp(tk.Tk):
         self.last_page_change = time.monotonic()
         self.preview_brightness = int(self.settings.data.get("preview_brightness", 100))
         self.monitor_style = self.settings.data.get("monitor_style", "cards")
-        self.visual_theme = self.settings.data.get("visual_theme", THEME_STANDARD)
+        self.visual_theme = self.settings.data.get("visual_theme", THEME_REBEL)
+        if self.visual_theme not in available_themes():
+            self.visual_theme = THEME_REBEL
         self.media_label = "Dados de demonstracao"
         self.album_art = None
         self.limits = self.settings.data.get("limits", {"CPU": 85, "GPU": 82, "Discos": 60, "RAM": 90})
@@ -907,7 +1011,7 @@ class PanelApp(tk.Tk):
         self.current_alert = ""
         self.last_metrics = self.metrics_provider.read()
         self.cpu_history: list[int] = [self.last_metrics.cpu_usage]
-        self.telemetry_history: list[dict] = [aggregate_point(self.last_metrics.cpu_usage, self.last_metrics.gpu_usage, self.last_metrics.ram_usage, [self.last_metrics.cpu_temperature, self.last_metrics.gpu_temperature])]
+        self.telemetry_history: list[dict] = [aggregate_point(self.last_metrics.cpu_usage, self.last_metrics.gpu_usage, self.last_metrics.ram_usage, [self.last_metrics.cpu_temperature, self.last_metrics.gpu_temperature], [disk.temperature for disk in self.last_metrics.disks])]
         self.network_rates = NetworkRates()
         self.rx_rate, self.tx_rate = self.network_rates.read()
         self.preview_static_frame = None
@@ -940,12 +1044,13 @@ class PanelApp(tk.Tk):
         root = tk.Frame(self, bg=self.theme["bg"], padx=16, pady=14)
         root.pack(fill="both", expand=True)
         main = tk.Frame(root, bg=self.theme["bg"]); main.pack(side="left", fill="both", expand=True)
-        side = tk.Frame(root, bg=self.theme["card"], width=310, padx=16, pady=14); side.pack(side="right", fill="y", padx=(16, 0)); side.pack_propagate(False)
+        side = tk.Frame(root, bg=self.theme["card"], width=310, padx=12, pady=12); side.pack(side="right", fill="y", padx=(16, 0)); side.pack_propagate(False)
         tk.Label(main, text="TELINHA", font=self.font_tuple("title", 20, True), bg=self.theme["bg"], fg=self.theme["text"]).pack(anchor="w")
         self.subtitle = tk.Label(main, text="Prévia e controle da sua tela", font=self.font_tuple("aux", 10), bg=self.theme["bg"], fg=self.theme["muted"]); self.subtitle.pack(anchor="w", pady=(2, 10))
         pages = tk.Frame(main, bg=self.theme["bg"]); pages.pack(anchor="w", pady=(0, 8))
         ttk.Button(pages, text="Monitor", command=lambda: self.set_page(0)).pack(side="left")
         ttk.Button(pages, text="Player", command=lambda: self.set_page(1)).pack(side="left", padx=6)
+        ttk.Button(pages, text="Processos", command=lambda: self.set_page(2)).pack(side="left", padx=6)
         self.page_label = tk.Label(pages, text="", bg=self.theme["bg"], fg=self.accent, font=self.font_tuple("aux", 10, True)); self.page_label.pack(side="left", padx=8)
         self.orientation_var = tk.StringVar(value=self.preview_orientation)
         for value, label in (("vertical", "Vertical"), ("horizontal", "Horizontal"), ("inverted", "Cabeça para baixo")):
@@ -957,14 +1062,21 @@ class PanelApp(tk.Tk):
         ttk.Button(main, text="Salvar configuração", command=self.save_configuration).pack(anchor="w", pady=(5, 0))
         self.save_status = tk.Label(main, text="", bg=self.theme["bg"], fg="#3fae68", font=self.font_tuple("aux", 9)); self.save_status.pack(anchor="w")
 
-        tk.Label(side, text="Estado", font=self.font_tuple("title", 15, True), bg=self.theme["card"], fg=self.theme["text"]).pack(anchor="w")
-        self.hardware_status = tk.Label(side, text="Procurando tela compatível…", wraplength=275, justify="left", bg=self.theme["card"], fg=self.theme["muted"]); self.hardware_status.pack(anchor="w", pady=(8, 0))
-        self.sensor_status = tk.Label(side, text="Sensores de disco: Libre Hardware Monitor (WMI) opcional. Abra o LHM e habilite WMI para temperatura/SMART; sem ele, valores ficam Indisponíveis.", wraplength=275, justify="left", bg=self.theme["card"], fg=self.theme["muted"]); self.sensor_status.pack(anchor="w", pady=(4, 0))
-        self.media_status = tk.Label(side, text="Mídia: verificando…", wraplength=275, justify="left", bg=self.theme["card"], fg=self.theme["muted"]); self.media_status.pack(anchor="w", pady=(5, 0))
-        tk.Label(side, text="Envio automático: a cada 1 segundo quando a tela compatível estiver disponível.", wraplength=275, justify="left", bg=self.theme["card"], fg="#3fae68").pack(anchor="w", pady=(5, 14))
-        tk.Label(side, text="Aparência", font=self.font_tuple("title", 11, True), bg=self.theme["card"], fg=self.theme["muted"]).pack(anchor="w")
-        ttk.Button(side, text="Cor de destaque", command=self.choose_accent).pack(anchor="w", pady=(5, 0))
-        theme_row = tk.Frame(side, bg=self.theme["card"]); theme_row.pack(fill="x", pady=(6, 0))
+        tabs = ttk.Notebook(side); tabs.pack(fill="both", expand=True)
+        overview = tk.Frame(tabs, bg=self.theme["card"], padx=10, pady=10)
+        appearance = tk.Frame(tabs, bg=self.theme["card"], padx=10, pady=10)
+        alerts_tab = tk.Frame(tabs, bg=self.theme["card"], padx=10, pady=10)
+        connection_tab = tk.Frame(tabs, bg=self.theme["card"], padx=10, pady=10)
+        tabs.add(overview, text="Resumo"); tabs.add(appearance, text="Visual")
+        tabs.add(alerts_tab, text="Alertas"); tabs.add(connection_tab, text="Tela USB")
+        tk.Label(overview, text="Estado", font=self.font_tuple("title", 15, True), bg=self.theme["card"], fg=self.theme["text"]).pack(anchor="w")
+        self.hardware_status = tk.Label(overview, text="Procurando tela compatível…", wraplength=255, justify="left", bg=self.theme["card"], fg=self.theme["muted"]); self.hardware_status.pack(anchor="w", pady=(8, 0))
+        self.sensor_status = tk.Label(overview, text="Sensores: verificando…", wraplength=255, justify="left", bg=self.theme["card"], fg=self.theme["muted"]); self.sensor_status.pack(anchor="w", pady=(4, 0))
+        self.media_status = tk.Label(overview, text="Mídia: verificando…", wraplength=255, justify="left", bg=self.theme["card"], fg=self.theme["muted"]); self.media_status.pack(anchor="w", pady=(5, 0))
+        tk.Label(overview, text="A tela é atualizada automaticamente quando estiver conectada.", wraplength=255, justify="left", bg=self.theme["card"], fg="#3fae68").pack(anchor="w", pady=(5, 14))
+        tk.Label(appearance, text="Aparência", font=self.font_tuple("title", 13, True), bg=self.theme["card"], fg=self.theme["text"]).pack(anchor="w")
+        ttk.Button(appearance, text="Cor de destaque", command=self.choose_accent).pack(anchor="w", pady=(8, 0))
+        theme_row = tk.Frame(appearance, bg=self.theme["card"]); theme_row.pack(fill="x", pady=(10, 0))
         tk.Label(theme_row, text="Tema do painel", bg=self.theme["card"], fg=self.theme["text"]).pack(anchor="w")
         self.visual_theme_var = tk.StringVar(value=self.visual_theme)
         ttk.Combobox(theme_row, textvariable=self.visual_theme_var, state="readonly", values=available_themes(), width=20).pack(anchor="w")
@@ -974,8 +1086,8 @@ class PanelApp(tk.Tk):
         ttk.Combobox(theme_row, textvariable=self.monitor_style_var, state="readonly", values=("cards", "graph"), width=20).pack(anchor="w")
         ttk.Button(theme_row, text="Aplicar visual", command=self.set_monitor_style).pack(anchor="w", pady=3)
         self.edit_layout_var = tk.BooleanVar(value=self.edit_layout)
-        tk.Checkbutton(side, text="Editar layout", variable=self.edit_layout_var, command=self.toggle_layout_edit, bg=self.theme["card"], fg=self.theme["text"], selectcolor=self.theme["card"]).pack(anchor="w", pady=(7, 0))
-        self.editor = tk.Frame(side, bg=self.theme["card"])
+        tk.Checkbutton(appearance, text="Editar layout da prévia", variable=self.edit_layout_var, command=self.toggle_layout_edit, bg=self.theme["card"], fg=self.theme["text"], selectcolor=self.theme["card"]).pack(anchor="w", pady=(14, 0))
+        self.editor = tk.Frame(appearance, bg=self.theme["card"])
         self.layout_help = tk.Label(self.editor, text="Clique em um item da prévia para editar.", wraplength=275, justify="left", bg=self.theme["card"], fg=self.theme["muted"]); self.layout_help.pack(anchor="w", pady=(6, 0))
         self.font_choice = tk.BooleanVar(value=self.custom_fonts_enabled)
         tk.Checkbutton(self.editor, text="Usar fontes personalizadas", variable=self.font_choice, command=self.toggle_font_set, bg=self.theme["card"], fg=self.theme["text"], selectcolor=self.theme["card"]).pack(anchor="w", pady=(5, 0))
@@ -990,27 +1102,27 @@ class PanelApp(tk.Tk):
         ttk.Button(self.inspector, text="Fundo transparente", command=lambda: self.set_item_color("background_color", None)).pack(anchor="w", pady=1)
         ttk.Button(self.inspector, text="Restaurar cores do item", command=self.reset_selected_colors).pack(anchor="w", pady=1)
         ttk.Button(self.inspector, text="Restaurar item", command=self.reset_selected_item).pack(anchor="w")
-        tk.Label(side, text="Rotação de páginas", font=self.font_tuple("title", 11, True), bg=self.theme["card"], fg=self.theme["muted"]).pack(anchor="w", pady=(16, 3))
+        tk.Label(overview, text="Rotação de páginas", font=self.font_tuple("title", 11, True), bg=self.theme["card"], fg=self.theme["muted"]).pack(anchor="w", pady=(16, 3))
         self.rotation_var = tk.BooleanVar(value=self.rotation_enabled)
-        tk.Checkbutton(side, text="Alternar Monitor e Player", variable=self.rotation_var, command=self.set_rotation, bg=self.theme["card"], fg=self.theme["text"], selectcolor=self.theme["card"]).pack(anchor="w")
+        tk.Checkbutton(overview, text="Alternar Monitor e Player", variable=self.rotation_var, command=self.set_rotation, bg=self.theme["card"], fg=self.theme["text"], selectcolor=self.theme["card"]).pack(anchor="w")
         self.rotation_interval_var = tk.DoubleVar(value=self.rotation_interval)
-        tk.Spinbox(side, from_=2, to=120, increment=1, width=6, textvariable=self.rotation_interval_var, command=self.set_rotation).pack(anchor="w", pady=3)
-        tk.Label(side, text="Manual continua disponível; ao tocar em Monitor/Player, a contagem reinicia.", wraplength=275, justify="left", bg=self.theme["card"], fg=self.theme["muted"]).pack(anchor="w")
-        tk.Label(side, text="Alertas", font=self.font_tuple("title", 11, True), bg=self.theme["card"], fg=self.theme["muted"]).pack(anchor="w", pady=(14, 3))
+        tk.Spinbox(overview, from_=2, to=120, increment=1, width=6, textvariable=self.rotation_interval_var, command=self.set_rotation).pack(anchor="w", pady=3)
+        tk.Label(overview, text="Manual continua disponível; os botões Monitor, Player e Processos sempre têm prioridade.", wraplength=255, justify="left", bg=self.theme["card"], fg=self.theme["muted"]).pack(anchor="w")
+        tk.Label(alerts_tab, text="Alertas", font=self.font_tuple("title", 13, True), bg=self.theme["card"], fg=self.theme["text"]).pack(anchor="w", pady=(2, 6))
         self.limit_vars, self.enabled_vars = {}, {}
         for key, label, low, high, suffix in (("CPU", "CPU", 30, 110, "°C"), ("GPU", "GPU", 30, 110, "°C"), ("Discos", "Discos", 30, 110, "°C"), ("RAM", "Uso de RAM", 1, 100, "%")):
-            row=tk.Frame(side,bg=self.theme["card"]); row.pack(fill="x", pady=2)
+            row=tk.Frame(alerts_tab,bg=self.theme["card"]); row.pack(fill="x", pady=4)
             self.enabled_vars[key]=tk.BooleanVar(value=self.enabled.get(key, True)); tk.Checkbutton(row,text=label,variable=self.enabled_vars[key],command=self.save_alerts,bg=self.theme["card"],fg=self.theme["text"],selectcolor=self.theme["card"]).pack(side="left")
             self.limit_vars[key]=tk.IntVar(value=self.limits.get(key, 85)); tk.Spinbox(row,from_=low,to=high,width=4,textvariable=self.limit_vars[key],command=self.save_alerts).pack(side="right")
             tk.Label(row,text=suffix,bg=self.theme["card"],fg=self.theme["muted"]).pack(side="right")
-        ttk.Button(side, text="Conexão avançada", command=self.toggle_connection_details).pack(anchor="w", pady=(12, 0))
-        self.connection = tk.Frame(side, bg=self.theme["card"])
+        tk.Label(connection_tab, text="Tela USB", font=self.font_tuple("title", 13, True), bg=self.theme["card"], fg=self.theme["text"]).pack(anchor="w", pady=(2, 8))
+        self.connection = tk.Frame(connection_tab, bg=self.theme["card"]); self.connection.pack(fill="x")
         self.port_var = tk.StringVar(value=self.settings.data["port"])
         tk.Entry(self.connection, textvariable=self.port_var, width=10).pack(anchor="w", pady=3)
         self.brightness_var = tk.IntVar(value=self.preview_brightness)
-        tk.Scale(self.connection, from_=10, to=100, orient="horizontal", variable=self.brightness_var, command=self.set_brightness, label="Brilho da prévia", bg=self.theme["card"], fg=self.theme["text"], highlightthickness=0).pack(anchor="w")
+        tk.Scale(self.connection, from_=10, to=100, orient="horizontal", variable=self.brightness_var, command=self.set_brightness, label="Brilho da tela", bg=self.theme["card"], fg=self.theme["text"], highlightthickness=0).pack(anchor="w")
         ttk.Button(self.connection, text="Verificar porta", command=self.check_port_status).pack(anchor="w")
-        if self.edit_layout: self.editor.pack(fill="x", pady=(4, 0))
+        if self.edit_layout: self.editor.pack(fill="x", pady=(6, 0))
         return
         root = tk.Frame(self, bg=self.theme["bg"], padx=18, pady=16)
         root.pack(fill="both", expand=True)
@@ -1157,7 +1269,7 @@ class PanelApp(tk.Tk):
         self.save_alerts()
 
     def next_page(self) -> None:
-        self.page = (self.page + 1) % 2
+        self.page = (self.page + 1) % 3
         self.draw(force=True)
 
     def set_page(self, page: int) -> None:
@@ -1188,8 +1300,13 @@ class PanelApp(tk.Tk):
         self.preview_brightness = int(self.brightness_var.get())
         self.save_preferences()
         if hasattr(self, "hardware_status"):
-            self.hardware_status.configure(text=brightness_status(self.preview_brightness) + "; o protocolo desta tela não documenta brilho físico.", fg=self.theme["muted"])
+            self.hardware_status.configure(text=brightness_status(self.preview_brightness), fg=self.theme["muted"])
         self.draw(force=True)
+        # The changed frame is also sent immediately when the user explicitly
+        # moves the slider. This is visual brightness on the real panel, not a
+        # firmware/backlight command.
+        if self.auto_send_enabled and self.preview_orientation == "vertical":
+            self.last_auto_send = 0.0
 
     def toggle_theme(self) -> None:
         self.dark = not self.dark
@@ -1407,20 +1524,19 @@ class PanelApp(tk.Tk):
     def render_live_frame(self):
         """The live frame is for the physical display, never the static preview."""
         frame = PanelFrameRenderer(self.theme, self.accent, self.custom_fonts_enabled, self.font_scale, self.layout_store.data, self.monitor_style, self.visual_theme).render(
-            self.page, self.last_metrics, self.track, self.current_alert, self.media_label, self.album_art, history=self.telemetry_history, network=(self.rx_rate, self.tx_rate))
+            self.page, self.last_metrics, self.track, self.current_alert, self.media_label, self.album_art, history=self.telemetry_history, network=(self.rx_rate, self.tx_rate), processes=self.processes)
         from PIL import Image
-        if self.preview_orientation == "horizontal": return frame.transpose(Image.Transpose.ROTATE_270)
-        if self.preview_orientation == "inverted": return frame.transpose(Image.Transpose.ROTATE_180)
-        return frame
+        if self.preview_orientation == "horizontal": frame = frame.transpose(Image.Transpose.ROTATE_270)
+        elif self.preview_orientation == "inverted": frame = frame.transpose(Image.Transpose.ROTATE_180)
+        from PIL import ImageEnhance
+        return ImageEnhance.Brightness(frame).enhance(self.preview_brightness / 100)
 
     def render_current_frame(self):
         return self.render_live_frame()
 
     def render_preview_frame(self):
-        """Cosmetic snapshot: brightness and motion are intentionally local only."""
-        from PIL import ImageEnhance
-        frame = self.render_live_frame()
-        return ImageEnhance.Brightness(frame).enhance(self.preview_brightness / 100)
+        """Preview mirrors exactly the brightness of the outgoing frame."""
+        return self.render_live_frame()
 
     def send_preview_to_screen(self) -> None:
         """User-initiated only: sends the exact image currently used in the preview."""
@@ -1574,9 +1690,11 @@ class PanelApp(tk.Tk):
             if hasattr(self, "sensor_status"):
                 self.sensor_status.configure(text="Sensores de disco: " + self.metrics_provider.sensor_status, fg=self.theme["muted"])
             self.cpu_history = (self.cpu_history + [self.last_metrics.cpu_usage])[-60:]
-            temperatures = [self.last_metrics.cpu_temperature, self.last_metrics.gpu_temperature, *(disk.temperature for disk in self.last_metrics.disks)]
-            self.telemetry_history = (self.telemetry_history + [aggregate_point(self.last_metrics.cpu_usage, self.last_metrics.gpu_usage, self.last_metrics.ram_usage, temperatures)])[-60:]
+            system_temperatures = [self.last_metrics.cpu_temperature, self.last_metrics.gpu_temperature]
+            disk_temperatures = [disk.temperature for disk in self.last_metrics.disks]
+            self.telemetry_history = (self.telemetry_history + [aggregate_point(self.last_metrics.cpu_usage, self.last_metrics.gpu_usage, self.last_metrics.ram_usage, system_temperatures, disk_temperatures)])[-60:]
             self.rx_rate, self.tx_rate = self.network_rates.read()
+            self.processes = self.process_sampler.read()
             self.last_metrics_update = now
             self.update_alerts()
         media_changed = self.poll_media()

@@ -32,9 +32,9 @@ def test_disk_mapping_keeps_unavailable_and_removes_duplicates():
     assert "Temperatura indisponível" in disk_label(disks[1])
 
 
-def test_brightness_is_honest_preview_only_for_revision_a():
+def test_brightness_is_honest_about_frame_based_physical_dimming():
     assert not HARDWARE_BRIGHTNESS_SUPPORTED
-    assert brightness_status(150) == "Brilho da prévia: 100%"
+    assert brightness_status(150) == "Brilho enviado à tela: 100%"
 
 
 def test_old_layout_migrates_by_removing_only_retired_lyrics():

@@ -12,16 +12,25 @@ def test_no_lhm_uses_explicit_unknown_volume_rows():
 
 
 def test_dual_graph_aggregation_omits_missing_temperature_and_formats_network():
-    assert aggregate_point(30, 60, 90, [None, 40]) == {"usage": 60, "temperature": 40}
+    assert aggregate_point(30, 60, 90, [None, 40], [35, 45]) == {"usage": 60, "temperature": 40, "disk_temperature": 40}
     assert aggregate_point(30, 60, 90, [None])["temperature"] is None
     assert rate_label(1536) == "1.5 KB/s"
 
 
 def test_rest_tree_parses_lhm_temperature_and_health_snapshot():
-    tree = {"Text": "LHM", "Children": [{"Text": "NVMe", "Children": [{"Text": "Temperature", "SensorType": "Temperature", "Value": "41.5 °C"}, {"Text": "Health", "SensorType": "Level", "Value": "98 %"}]}]}
+    tree = {"Text": "LHM", "Children": [{"Text": "NVMe", "HardwareId": "/hdd/0", "ImageURL": "images_icon/hdd.png", "Children": [{"Text": "Temperature", "SensorType": "Temperature", "Value": "41,5 °C"}, {"Text": "Health", "SensorType": "Level", "Value": "98 %"}]}]}
     rows = disk_rows(parse_lhm_rest_tree(tree), [])
     assert rows[0]["name"] == "NVMe"
-    assert rows[0]["temperature"] == 41
+    assert rows[0]["temperature"] == 42
+
+
+def test_disk_rows_rejects_voltage_and_generic_temperature_groups():
+    rows = disk_rows([
+        {"name": "Voltage #1", "type": "Voltage", "value": 3.3, "parent": "Voltages"},
+        {"name": "Temperature #1", "type": "Temperature", "value": 48.0, "parent": "Temperatures"},
+        {"name": "Temperature", "type": "Temperature", "value": 41.0, "parent": "Real SSD", "hardware_kind": "hdd.png"},
+    ], ["Fallback C:"])
+    assert rows == [{"name": "Real SSD", "temperature": 41, "health": "Indisponível"}]
 
 
 def test_rest_query_fallback_is_empty_when_local_server_is_unavailable():

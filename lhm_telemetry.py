@@ -2,24 +2,46 @@
 from __future__ import annotations
 
 import json
+import re
 import subprocess
 from pathlib import Path
 from urllib.request import urlopen
 
+from sensor_bridge import query_sensor_bridge
+
+
+def _has_storage_sensor(sensors: list[dict]) -> bool:
+    return any("storage" in str(item.get("hardware_kind") or "").casefold() or
+               any(token in str(item.get("parent") or "").casefold() for token in ("ssd", "hdd", "nvme", "disk", "wdc ", "xraydisk"))
+               for item in sensors)
+
 
 def disk_rows(sensor_snapshot: list[dict], volumes: list[str]) -> list[dict]:
-    """Map LHM sensor snapshots to disks; fall back only to explicit unknown rows."""
+    """Map only physical-storage sensors; never promote LHM category nodes to disks."""
     grouped: dict[str, dict] = {}
     for sensor in sensor_snapshot:
-        parent = str(sensor.get("parent") or sensor.get("hardware") or "Disco desconhecido")
-        row = grouped.setdefault(parent, {"name": parent, "temperature": None, "health": "Indisponível"})
+        hardware_kind = str(sensor.get("hardware_kind") or "").casefold()
+        parent = str(sensor.get("parent") or sensor.get("hardware") or "")
+        parent_key = parent.casefold()
+        is_storage = ("hdd" in hardware_kind or "storage" in hardware_kind or
+                      any(token in parent_key for token in ("ssd", "hdd", "nvme", "disk", "wdc ", "seagate", "samsung", "crucial", "xraydisk")))
+        if not is_storage:
+            continue
+        row = grouped.setdefault(parent or "Disco desconhecido", {"name": parent or "Disco desconhecido", "temperature": None, "health": "Indisponível", "_temperatures": []})
         kind, name, value = str(sensor.get("type", "")).casefold(), str(sensor.get("name", "")).casefold(), sensor.get("value")
         if ("temperature" in kind or "temperature" in name) and isinstance(value, (int, float)):
-            row["temperature"] = int(value)
+            # Some drives publish more than one temperature. Average those
+            # readings for that drive only; never add temperatures together.
+            row["_temperatures"].append(float(value))
         if "health" in kind or "life" in name or "health" in name:
             row["health"] = str(value) if value not in (None, "") else "Indisponível"
     if grouped:
-        return list(grouped.values())
+        result = []
+        for row in grouped.values():
+            readings = row.pop("_temperatures")
+            row["temperature"] = round(sum(readings) / len(readings)) if readings else None
+            result.append(row)
+        return result
     return [{"name": volume, "temperature": None, "health": "Indisponível"} for volume in volumes]
 
 
@@ -35,22 +57,25 @@ def query_lhm_wmi() -> tuple[list[dict], str]:
         return [], "Libre Hardware Monitor indisponível"
 
 
-def parse_lhm_rest_tree(node: dict, parent: str = "") -> list[dict]:
+def parse_lhm_rest_tree(node: dict, parent: str = "", hardware_kind: str = "") -> list[dict]:
     """Flatten LHM's data.json tree without assuming every node is a sensor."""
     name = str(node.get("Text") or node.get("Name") or "")
     sensor_type = str(node.get("SensorType") or node.get("Type") or "")
     value = node.get("Value")
     result = []
-    if sensor_type or value not in (None, ""):
+    if sensor_type:
         numeric = value
         if isinstance(value, str):
-            digits = "".join(char for char in value if char.isdigit() or char in ".-")
-            try: numeric = float(digits) if digits else value
+            match = re.search(r"[-+]?\d+(?:[.,]\d+)?", value)
+            try: numeric = float(match.group(0).replace(",", ".")) if match else value
             except ValueError: numeric = value
-        result.append({"name": name, "type": sensor_type, "value": numeric, "parent": parent})
-    next_parent = name or parent
+        result.append({"name": name, "type": sensor_type, "value": numeric, "parent": parent, "hardware_kind": hardware_kind})
+    image = str(node.get("ImageURL") or "")
+    is_hardware = bool(node.get("HardwareId"))
+    next_parent = name if is_hardware else parent
+    next_kind = image if is_hardware else hardware_kind
     for child in node.get("Children", []) or []:
-        result.extend(parse_lhm_rest_tree(child, next_parent))
+        result.extend(parse_lhm_rest_tree(child, next_parent, next_kind))
     return result
 
 
@@ -64,10 +89,16 @@ def query_lhm_rest(opener=urlopen) -> tuple[list[dict], str]:
 
 
 def query_lhm() -> tuple[list[dict], str]:
+    sensors, status = query_sensor_bridge()
+    if sensors and _has_storage_sensor(sensors):
+        return sensors, status
+    bridge_sensors, bridge_status = sensors, status
     sensors, status = query_lhm_rest()
     if sensors: return sensors, status
     sensors, status = query_lhm_wmi()
     if sensors: return sensors, status
+    if bridge_sensors:
+        return bridge_sensors, bridge_status
     if Path(r"C:\LibreHardwareMonitor\LibreHardwareMonitor.exe").exists():
         return [], "Libre Hardware Monitor aberto/instalado; ative Options > Web Server > Run web server (porta 8085)."
     return [], "Libre Hardware Monitor indisponível"
