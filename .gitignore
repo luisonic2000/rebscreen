@@ -1,0 +1,32 @@
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+*.egg-info/
+
+# Build and package outputs
+build/
+dist/
+*.spec
+package_*/
+pyinstaller_work_*/
+
+# Local application state and logs
+settings.json
+panel_layout.json
+*.log
+*.tmp
+
+# Windows metadata
+Thumbs.db
+Desktop.ini
+
+# Downloaded hardware dependencies and generated releases
+Executavel/
+Dependencias/
+_internal/
+*.exe
+*.dll
+*.pdb
