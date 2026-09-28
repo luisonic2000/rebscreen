@@ -43,6 +43,7 @@ from telemetry_history import aggregate_point, rate_label
 from layout_colors import reset_item_colors, set_item_color
 from process_telemetry import ProcessSampler, ProcessRow
 from background_runtime import LatestTask
+from auto_send_policy import MINIMUM_SEND_INTERVAL, initial_auto_send, send_interval
 
 
 RESOURCE_DIR = Path(getattr(sys, "_MEIPASS", Path(__file__).parent))
@@ -65,7 +66,7 @@ CUSTOM_FONT_FAMILIES = {"title": "Coolvetica", "metric": "Coolvetica Cond", "aux
 
 class SettingsStore:
     default = {"dark": True, "accent": "#5b8cff", "custom_fonts": True, "font_scale": 1.0,
-               "auto_switch_media": False, "auto_send": True, "send_interval": 1.0, "port": "COM3", "orientation": "vertical",
+               "auto_switch_media": False, "auto_send": False, "auto_send_approved": False, "send_interval": MINIMUM_SEND_INTERVAL, "port": "COM3", "orientation": "vertical",
                "geometry": "1180x760", "rotation_enabled": False, "rotation_interval": 10.0,
                "rotation_pages": [True, True, True], "preview_brightness": 100, "monitor_style": "cards", "visual_theme": THEME_REBEL}
     def __init__(self) -> None:
@@ -1008,14 +1009,15 @@ class PanelApp(tk.Tk):
         # Older preference files may contain this value.  Navigation is now
         # always manual, so refreshes cannot take the user away from a page.
         self.auto_switch_media = False
-        # Release smoke checks can explicitly suppress physical I/O.
-        self.auto_send_enabled = not bool(os.getenv("REBSCREEN_SAFE_START"))
+        # Automatic USB writes require an explicit choice. This also prevents
+        # old preferences from enabling a high-bandwidth loop unexpectedly.
+        self.auto_send_enabled = initial_auto_send(self.settings.data, bool(os.getenv("REBSCREEN_SAFE_START")))
         self.preview_orientation = self.settings.data.get("orientation", "vertical")
         self.layout_store.activate(self.preview_orientation)
         self.edit_layout = False
         self.layout_selection = None
         self.layout_drag_origin = None
-        self.send_interval = max(1.0, float(self.settings.data["send_interval"]))
+        self.send_interval = send_interval(self.settings.data.get("send_interval", MINIMUM_SEND_INTERVAL))
         self.last_auto_send = 0.0
         self.rotation_enabled = bool(self.settings.data.get("rotation_enabled", False))
         self.rotation_interval = max(2.0, float(self.settings.data.get("rotation_interval", 10)))
@@ -1225,15 +1227,15 @@ class PanelApp(tk.Tk):
         self.media_status.pack(anchor="w", pady=(7, 0))
         self.media_diagnostics = tk.Label(right, text="Diagnóstico GSMTC: aguardando consulta.", wraplength=220, justify="left", font=("Segoe UI", 8), bg=self.theme["card"], fg=self.theme["muted"])
         self.media_diagnostics.pack(anchor="w", pady=(3, 0))
-        tk.Label(right, text="Sincronização automática: ligada (1 s)", wraplength=220, justify="left", font=("Segoe UI", 8), bg=self.theme["card"], fg="#3fae68").pack(anchor="w", pady=(3, 0))
+        tk.Label(right, text="Mídia consulta em segundo plano; a página só muda pelos botões.", wraplength=220, justify="left", font=("Segoe UI", 8), bg=self.theme["card"], fg=self.theme["muted"]).pack(anchor="w", pady=(3, 0))
         ttk.Button(right, text="Atualizar mídia agora", command=self.refresh_media_now).pack(anchor="w", pady=(5, 0))
         self.auto_send_var = tk.BooleanVar(value=self.auto_send_enabled)
-        tk.Checkbutton(right, text="Enviar automaticamente a tela", variable=self.auto_send_var, command=self.set_auto_send, bg=self.theme["card"], fg=self.theme["text"], selectcolor=self.theme["card"]).pack(anchor="w", pady=(8, 0))
+        tk.Checkbutton(right, text="Atualização automática USB", variable=self.auto_send_var, command=self.set_auto_send, bg=self.theme["card"], fg=self.theme["text"], selectcolor=self.theme["card"]).pack(anchor="w", pady=(8, 0))
         cadence_row = tk.Frame(right, bg=self.theme["card"]); cadence_row.pack(fill="x")
-        tk.Label(cadence_row, text="Cadencia (s)", bg=self.theme["card"], fg=self.theme["text"]).pack(side="left")
+        tk.Label(cadence_row, text="Cadência USB (s)", bg=self.theme["card"], fg=self.theme["text"]).pack(side="left")
         self.send_interval_var = tk.DoubleVar(value=self.send_interval)
-        tk.Spinbox(cadence_row, from_=1.5, to=30, increment=0.5, width=5, textvariable=self.send_interval_var, command=self.set_send_interval).pack(side="right")
-        tk.Label(right, text="A mídia atualiza a cada 1 s; a página só muda pelos botões Monitor/Player ou Ctrl+1/Ctrl+2.", wraplength=220, justify="left", font=("Segoe UI", 8), bg=self.theme["card"], fg=self.theme["muted"]).pack(anchor="w", pady=(4, 0))
+        tk.Spinbox(cadence_row, from_=MINIMUM_SEND_INTERVAL, to=300, increment=5, width=5, textvariable=self.send_interval_var, command=self.set_send_interval).pack(side="right")
+        tk.Label(right, text="Desligada por padrão. Um quadro completo leva cerca de 27 s; mínimo de 30 s entre envios.", wraplength=220, justify="left", font=("Segoe UI", 8), bg=self.theme["card"], fg=self.theme["muted"]).pack(anchor="w", pady=(4, 0))
         tk.Label(right, text="Aparência", font=self.font_tuple("title", 11, True), bg=self.theme["card"], fg=self.theme["muted"]).pack(anchor="w", pady=(16, 3))
         scale_row = tk.Frame(right, bg=self.theme["card"]); scale_row.pack(fill="x", pady=(6, 0))
         tk.Label(scale_row, text="Escala de fonte", bg=self.theme["card"], fg=self.theme["text"]).pack(side="left")
@@ -1395,11 +1397,13 @@ class PanelApp(tk.Tk):
 
     def set_auto_send(self) -> None:
         self.auto_send_enabled = self.auto_send_var.get()
+        self.settings.data["auto_send_approved"] = True
         self.save_preferences()
-        self.hardware_status.configure(text="Envio automatico ATIVO." if self.auto_send_enabled else "Envio automatico desligado.", fg="#ef9b3e" if self.auto_send_enabled else self.theme["muted"])
+        self.hardware_status.configure(text="Atualização USB automática ativada." if self.auto_send_enabled else "Atualização USB automática desligada.", fg="#ef9b3e" if self.auto_send_enabled else self.theme["muted"])
 
     def set_send_interval(self) -> None:
-        self.send_interval = max(1.5, float(self.send_interval_var.get()))
+        self.send_interval = send_interval(self.send_interval_var.get())
+        self.send_interval_var.set(self.send_interval)
         self.save_preferences()
 
     def set_orientation(self) -> None:
