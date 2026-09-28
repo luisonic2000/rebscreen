@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import re
 import subprocess
+import time
 from pathlib import Path
 from urllib.request import urlopen
 
@@ -88,17 +89,64 @@ def query_lhm_rest(opener=urlopen) -> tuple[list[dict], str]:
         return [], ""
 
 
-def query_lhm() -> tuple[list[dict], str]:
-    sensors, status = query_sensor_bridge()
+def query_lhm(bridge_query=query_sensor_bridge, rest_query=query_lhm_rest,
+              wmi_query=query_lhm_wmi, lhm_installed=None) -> tuple[list[dict], str]:
+    """Discover the best available source once.
+
+    Injectable dependencies keep this discovery deterministic in the controlled
+    test harness.  Production callers use the local bridge, REST, then legacy
+    WMI fallback in that order.
+    """
+    sensors, status = bridge_query()
     if sensors and _has_storage_sensor(sensors):
         return sensors, status
     bridge_sensors, bridge_status = sensors, status
-    sensors, status = query_lhm_rest()
+    sensors, status = rest_query()
     if sensors: return sensors, status
-    sensors, status = query_lhm_wmi()
+    sensors, status = wmi_query()
     if sensors: return sensors, status
     if bridge_sensors:
         return bridge_sensors, bridge_status
-    if Path(r"C:\LibreHardwareMonitor\LibreHardwareMonitor.exe").exists():
+    installed = lhm_installed or (lambda: Path(r"C:\LibreHardwareMonitor\LibreHardwareMonitor.exe").exists())
+    if installed():
         return [], "Libre Hardware Monitor aberto/instalado; ative Options > Web Server > Run web server (porta 8085)."
     return [], "Libre Hardware Monitor indisponível"
+
+
+class LhmSession:
+    """Keep one discovery result per Rebscreen run.
+
+    WMI discovery starts PowerShell, so it is intentionally never repeated.
+    A source discovered through the local REST server may be polled again,
+    because it stays inside the local HTTP connection and runs in Rebscreen's
+    existing telemetry worker.
+    """
+
+    def __init__(self, discover=query_lhm, rest_query=query_lhm_rest,
+                 clock=time.monotonic, rest_interval: float = 5.0):
+        self._discover = discover
+        self._rest_query = rest_query
+        self._clock = clock
+        self._rest_interval = rest_interval
+        self._discovered = False
+        self._uses_rest = False
+        self._last_rest_poll = 0.0
+        self._sensors: list[dict] = []
+        self._status = "Libre Hardware Monitor indisponível"
+
+    def snapshot(self) -> tuple[list[dict], str]:
+        now = self._clock()
+        if not self._discovered:
+            self._sensors, self._status = self._discover()
+            self._discovered = True
+            self._uses_rest = self._status == "Libre Hardware Monitor (REST local)"
+            self._last_rest_poll = now
+        elif self._uses_rest and now - self._last_rest_poll >= self._rest_interval:
+            sensors, status = self._rest_query()
+            self._last_rest_poll = now
+            if sensors:
+                self._sensors, self._status = sensors, status
+            else:
+                self._sensors = []
+                self._status = "Libre Hardware Monitor (REST local) indisponível"
+        return self._sensors, self._status

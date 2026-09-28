@@ -6,7 +6,7 @@ import random
 import time
 
 from disk_inventory import query_disk_inventory
-from lhm_telemetry import disk_rows, query_lhm
+from lhm_telemetry import LhmSession, disk_rows
 from panel_models import Disk, Metrics
 
 
@@ -28,12 +28,12 @@ def demo_screen_notice(metrics: Metrics) -> str:
 class SampleMetricsProvider:
     """Temporary CPU/GPU/RAM samples plus optionally real disk inventory/SMART."""
 
-    def __init__(self):
+    def __init__(self, sensor_session: LhmSession | None = None):
         self.sensor_status = "Sensores de disco: verificando Libre Hardware Monitor…"
         self._inventory: list[dict] = []
         self._disk_history: dict[str, dict[str, list]] = {}
         self._sensor_snapshot: list[dict] = []
-        self._sensor_checked_at = 0.0
+        self._sensor_session = sensor_session or LhmSession()
 
     def disks(self) -> list[Disk]:
         if os.name != "nt":
@@ -41,10 +41,7 @@ class SampleMetricsProvider:
         if not self._inventory:
             self._inventory = query_disk_inventory()
         volumes = [item["name"] for item in self._inventory]
-        now = time.monotonic()
-        if now - self._sensor_checked_at >= 5.0:
-            self._sensor_snapshot, self.sensor_status = query_lhm()
-            self._sensor_checked_at = now
+        self._sensor_snapshot, self.sensor_status = self._sensor_session.snapshot()
         sensor_by_name = {item["name"].casefold(): item for item in disk_rows(self._sensor_snapshot, volumes)}
         disks = []
         for item in self._inventory[:6]:

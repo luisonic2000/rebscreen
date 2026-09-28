@@ -2,6 +2,8 @@ from itertools import cycle
 from types import SimpleNamespace
 
 from app import Disk, Metrics, PanelApp
+from lhm_telemetry import LhmSession
+import sample_telemetry
 from sample_telemetry import SampleMetricsProvider, demo_screen_notice, telemetry_source_label
 
 
@@ -28,3 +30,17 @@ def test_demo_components_never_create_temperature_or_usage_alerts():
     PanelApp.update_alerts(panel)
 
     assert panel.alerts == ["ALERTA SSD: 75 °C • limite 60 °C"]
+
+
+def test_provider_reuses_one_unavailable_lhm_discovery_across_periodic_disk_reads(monkeypatch):
+    discoveries = []
+    session = LhmSession(discover=lambda: (discoveries.append("WMI") or [], "Libre Hardware Monitor indisponível"))
+    monkeypatch.setattr(sample_telemetry.os, "name", "nt")
+    monkeypatch.setattr(sample_telemetry, "query_disk_inventory", lambda: [{"name": "NVMe (C:)", "usage": 10, "units": ["C:"]}])
+
+    provider = SampleMetricsProvider(sensor_session=session)
+    provider.disks()
+    provider.disks()
+
+    assert discoveries == ["WMI"]
+    assert provider.sensor_status == "Libre Hardware Monitor indisponível"

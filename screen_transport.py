@@ -5,11 +5,17 @@ functions in a background worker instead of opening a port directly.
 """
 from __future__ import annotations
 
+from dataclasses import dataclass
 from pathlib import Path
 import sys
+import threading
+import time
 
 
 RESOURCE_DIR = Path(getattr(sys, "_MEIPASS", Path(__file__).parent))
+FULL_FRAME_RESYNC_INTERVAL = 300.0
+SERIAL_RETRY_BASE = 5.0
+SERIAL_RETRY_MAX = 60.0
 FONT_FILES = {
     "title": RESOURCE_DIR / "assets" / "fonts" / "Coolvetica Rg.otf",
     "metric": RESOURCE_DIR / "assets" / "fonts" / "Coolvetica Rg Cond.otf",
@@ -36,6 +42,22 @@ class TuringScreenTransport:
                       ((y & 15) << 4) | (ex >> 6), ((ex & 63) << 2) | (ey >> 8),
                       ey & 255, command))
 
+    @staticmethod
+    def _rgb565_bytes(image) -> bytes:
+        pixels = bytearray()
+        for red, green, blue in image.convert("RGB").getdata():
+            value = ((red & 0xF8) << 8) | ((green & 0xFC) << 3) | (blue >> 3)
+            pixels.extend((value & 0xFF, value >> 8))
+        return bytes(pixels)
+
+    @staticmethod
+    def _orientation_command(width: int, height: int) -> bytes:
+        orientation = bytearray(16)
+        orientation[5] = 121
+        orientation[6] = 100
+        orientation[7:11] = bytes((width >> 8, width & 255, height >> 8, height & 255))
+        return bytes(orientation)
+
     def send_pil_image(self, image) -> None:
         """Send one complete image without changing firmware or persistent state."""
         try:
@@ -60,6 +82,109 @@ class TuringScreenTransport:
             for start in range(0, len(pixels), self.WIDTH * 8):
                 device.write(pixels[start:start + self.WIDTH * 8])
             device.flush()
+
+    def send_changed_image(self, image, previous) -> int:
+        """Send only changed RGB565 pixel runs through the existing window command."""
+        try:
+            import serial
+        except ImportError as exc:
+            raise RuntimeError("pyserial não está disponível neste Python.") from exc
+        if image.size != (self.WIDTH, self.HEIGHT):
+            image = image.resize((self.WIDTH, self.HEIGHT))
+        if previous.size != (self.WIDTH, self.HEIGHT):
+            previous = previous.resize((self.WIDTH, self.HEIGHT))
+        pixels = self._rgb565_bytes(image)
+        old_pixels = self._rgb565_bytes(previous)
+        changed = sum(pixels[index:index + 2] != old_pixels[index:index + 2] for index in range(0, len(pixels), 2))
+        if not changed:
+            return 0
+        with serial.Serial(self.port, 115200, timeout=1, write_timeout=5, rtscts=True) as device:
+            device.write(self._orientation_command(self.WIDTH, self.HEIGHT))
+            for y in range(self.HEIGHT):
+                row_start = y * self.WIDTH * 2
+                x = 0
+                while x < self.WIDTH:
+                    offset = row_start + x * 2
+                    if pixels[offset:offset + 2] == old_pixels[offset:offset + 2]:
+                        x += 1
+                        continue
+                    start = x
+                    x += 1
+                    while x < self.WIDTH:
+                        offset = row_start + x * 2
+                        if pixels[offset:offset + 2] == old_pixels[offset:offset + 2]:
+                            break
+                        x += 1
+                    end = x - 1
+                    device.write(self._command(start, y, end, y, 197))
+                    left = row_start + start * 2
+                    right = row_start + (end + 1) * 2
+                    device.write(pixels[left:right])
+            device.flush()
+        return changed
+
+
+@dataclass(frozen=True)
+class IncrementalSendResult:
+    full_refresh: bool
+    changed_pixels: int = 0
+
+
+class IncrementalFrameSender:
+    """Serialize full/delta frames and preserve a safe recovery path after errors."""
+
+    def __init__(self, port: str, transport=None, clock=time.monotonic,
+                 full_refresh_interval: float = FULL_FRAME_RESYNC_INTERVAL):
+        self.port = port
+        self.transport = transport or TuringScreenTransport(port)
+        self.clock = clock
+        self.full_refresh_interval = full_refresh_interval
+        self.previous = None
+        self.last_full_refresh = float("-inf")
+        self.retry_at = 0.0
+        self.retry_delay = SERIAL_RETRY_BASE
+        self._lock = threading.Lock()
+
+    def can_send(self, now: float | None = None) -> bool:
+        return (self.clock() if now is None else now) >= self.retry_at
+
+    def invalidate(self) -> None:
+        """Force the next automatic frame to resynchronize the physical display."""
+        with self._lock:
+            self.previous = None
+
+    def send_frame(self, image) -> IncrementalSendResult:
+        with self._lock:
+            now = self.clock()
+            if not self.can_send(now):
+                raise RuntimeError("serial transport is in backoff")
+            full_refresh = self.previous is None or now - self.last_full_refresh >= self.full_refresh_interval
+            try:
+                if full_refresh:
+                    self.transport.send_pil_image(image)
+                    self.previous = image.copy()
+                    self.last_full_refresh = now
+                    changed = self.WIDTH_HEIGHT_PIXELS
+                else:
+                    changed = self.transport.send_changed_image(image, self.previous)
+                    self.previous = image.copy()
+                self.retry_delay = SERIAL_RETRY_BASE
+                return IncrementalSendResult(full_refresh=full_refresh, changed_pixels=changed)
+            except OSError:
+                self.previous = None
+                self.retry_at = now + self.retry_delay
+                self.retry_delay = min(SERIAL_RETRY_MAX, self.retry_delay * 2)
+                raise
+
+    @property
+    def WIDTH_HEIGHT_PIXELS(self) -> int:
+        return TuringScreenTransport.WIDTH * TuringScreenTransport.HEIGHT
+
+
+def send_incremental_frame_to_display(sender: IncrementalFrameSender, frame) -> str:
+    """Queue-facing adapter that keeps the sender's frame cache in one worker."""
+    sender.send_frame(frame)
+    return f"Prévia enviada para {sender.port}."
 
     def send_test_frame(self, label: str = "CONEXAO OK") -> None:
         """Send a reversible diagnostic frame."""

@@ -1,10 +1,10 @@
-# Rebscreen — estado
+# Rebscreen 0.2-beta — estado
 
-- Fonte oficial de desenvolvimento: este repositório, na branch local `codex/test-foundation` durante esta rodada. Nenhum commit foi enviado ao GitHub.
-- Temas suportados: `Rebel` (padrão) e `Painel Técnico` (alternativo).
-- A prévia possui três páginas: Monitor, Player e Processos. A rotação inclui as três e configurações antigas de duas páginas são migradas.
-- Telemetria: CPU, GPU e RAM ainda são amostras de demonstração, identificadas visualmente. Elas não geram alertas. Inventário, uso e sensores de discos podem usar fontes locais quando disponíveis.
-- Libre Hardware Monitor: REST local `http://127.0.0.1:8085/data.json` é preferido. Se não responder, ative `Options > Web Server > Run web server` na porta 8085; WMI é apenas alternativa legada.
-- `Sinal` é download e `Link` é upload, calculados por delta da interface física ativa.
-- Envio USB automático é opt-in, inicia desligado e tem cadência mínima de 30 s. O protocolo e o firmware não foram modificados.
-- Nesta rodada não houve build, acesso a COM3 ou teste físico. A última suíte local passou com 73 testes.
+- A branch de trabalho é `main`. Nenhum commit, push, tag ou Release foi criado nesta rodada.
+- Temas: Rebel (padrão), Painel Técnico e Cassette Futurism, cada um renderizado pelo quadro compartilhado 320×480.
+- Idiomas: inglês padrão, português do Brasil, espanhol, italiano, russo e chinês simplificado. A escolha é salva em `%LOCALAPPDATA%\Rebscreen\settings.json`.
+- O seletor do README dá acesso às descrições nos seis idiomas. A descrição curta About do GitHub permanece um texto estático e não foi alterada remotamente.
+- `Como resolver` gera um TXT UTF-8 no idioma escolhido quando sensores, mídia, USB serial, telemetria de processos ou bandeja opcional não estão disponíveis.
+- CPU, GPU e RAM continuam sendo dados de demonstração identificados; seus alertas permanecem desativados. Sensores de disco dependem das fontes locais configuradas.
+- A suíte completa passou com 98 testes e um aviso de depreciação Pillow em `screen_transport.py` (`Image.getdata`). Sem build, acesso a COM ou validação física nesta rodada.
+- Quatro arquivos de telemetria/testes previamente modificados pelo Codex e dois itens não rastreados foram preservados sem alteração.

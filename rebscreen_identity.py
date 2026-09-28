@@ -5,6 +5,7 @@ from datetime import datetime
 
 
 APP_NAME = "Rebscreen"
+APP_VERSION = "0.2-beta"
 
 
 def header_state(now: datetime | None = None) -> tuple[str, str]:

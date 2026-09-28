@@ -18,8 +18,10 @@ def test_safe_start_overrides_a_saved_automatic_send_preference():
     assert initial_auto_send({"auto_send": True, "auto_send_approved": True}, safe_start=True) is False
 
 
-def test_cadence_never_allows_a_full_frame_more_often_than_the_link_can_handle():
-    assert send_interval(1) == MINIMUM_SEND_INTERVAL
+def test_cadence_allows_one_second_incremental_frames_after_the_initial_sync():
+    assert MINIMUM_SEND_INTERVAL == 1.0
+    assert send_interval(0.2) == 1.0
+    assert send_interval(1) == 1.0
     assert send_interval(60) == 60
 
 

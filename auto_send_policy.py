@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 
-MINIMUM_SEND_INTERVAL = 30.0
+MINIMUM_SEND_INTERVAL = 1.0
 
 
 def initial_auto_send(settings: dict, safe_start: bool = False) -> bool:
@@ -11,5 +11,5 @@ def initial_auto_send(settings: dict, safe_start: bool = False) -> bool:
 
 
 def send_interval(value: float | int | str) -> float:
-    """A full 320×480 RGB565 frame needs roughly 27 s at 115200 baud."""
+    """Incremental frames may be scheduled every second after full synchronization."""
     return max(MINIMUM_SEND_INTERVAL, float(value))
