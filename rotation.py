@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 
-def next_enabled_page(current: int, enabled: tuple[bool, bool]) -> int:
+def next_enabled_page(current: int, enabled: tuple[bool, ...]) -> int:
     available = [index for index, allowed in enumerate(enabled) if allowed]
     if not available:
         return current

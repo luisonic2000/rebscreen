@@ -44,6 +44,7 @@ from layout_colors import reset_item_colors, set_item_color
 from process_telemetry import ProcessSampler, ProcessRow
 from background_runtime import LatestTask
 from auto_send_policy import MINIMUM_SEND_INTERVAL, initial_auto_send, send_interval
+from page_navigation import PAGE_LABELS, normalize_page, normalize_rotation_pages
 
 
 RESOURCE_DIR = Path(getattr(sys, "_MEIPASS", Path(__file__).parent))
@@ -1021,7 +1022,7 @@ class PanelApp(tk.Tk):
         self.last_auto_send = 0.0
         self.rotation_enabled = bool(self.settings.data.get("rotation_enabled", False))
         self.rotation_interval = max(2.0, float(self.settings.data.get("rotation_interval", 10)))
-        self.rotation_pages = tuple(self.settings.data.get("rotation_pages", [True, True]))
+        self.rotation_pages = normalize_rotation_pages(self.settings.data.get("rotation_pages", [True, True, True]))
         self.last_page_change = time.monotonic()
         self.preview_brightness = int(self.settings.data.get("preview_brightness", 100))
         self.monitor_style = self.settings.data.get("monitor_style", "cards")
@@ -1056,6 +1057,7 @@ class PanelApp(tk.Tk):
         self.tray_icon = None
         self.protocol("WM_DELETE_WINDOW", self.on_main_window_close)
         self._build_ui()
+        self._draw_initial_preview()
         self.single_instance.listen(lambda: self.after(0, self.show_from_tray))
         self.bind_all("<Control-Key-1>", lambda _event: self.set_page(0))
         self.bind_all("<Control-Key-2>", lambda _event: self.set_page(1))
@@ -1135,7 +1137,7 @@ class PanelApp(tk.Tk):
         ttk.Button(self.inspector, text="Restaurar item", command=self.reset_selected_item).pack(anchor="w")
         tk.Label(overview, text="Rotação de páginas", font=self.font_tuple("title", 11, True), bg=self.theme["card"], fg=self.theme["muted"]).pack(anchor="w", pady=(16, 3))
         self.rotation_var = tk.BooleanVar(value=self.rotation_enabled)
-        tk.Checkbutton(overview, text="Alternar Monitor e Player", variable=self.rotation_var, command=self.set_rotation, bg=self.theme["card"], fg=self.theme["text"], selectcolor=self.theme["card"]).pack(anchor="w")
+        tk.Checkbutton(overview, text="Alternar páginas", variable=self.rotation_var, command=self.set_rotation, bg=self.theme["card"], fg=self.theme["text"], selectcolor=self.theme["card"]).pack(anchor="w")
         self.rotation_interval_var = tk.DoubleVar(value=self.rotation_interval)
         tk.Spinbox(overview, from_=2, to=120, increment=1, width=6, textvariable=self.rotation_interval_var, command=self.set_rotation).pack(anchor="w", pady=3)
         tk.Label(overview, text="Manual continua disponível; os botões Monitor, Player e Processos sempre têm prioridade.", wraplength=255, justify="left", bg=self.theme["card"], fg=self.theme["muted"]).pack(anchor="w")
@@ -1153,6 +1155,15 @@ class PanelApp(tk.Tk):
         self.brightness_var = tk.IntVar(value=self.preview_brightness)
         tk.Scale(self.connection, from_=10, to=100, orient="horizontal", variable=self.brightness_var, command=self.set_brightness, label="Brilho da tela", bg=self.theme["card"], fg=self.theme["text"], highlightthickness=0).pack(anchor="w")
         ttk.Button(self.connection, text="Verificar porta", command=self.check_port_status).pack(anchor="w")
+        ttk.Button(self.connection, text="Enviar esta prévia", command=self.send_preview_to_screen).pack(anchor="w", pady=(6, 0))
+        ttk.Button(self.connection, text="Enviar calibração de cores", command=self.send_screen_test).pack(anchor="w", pady=(3, 0))
+        self.auto_send_var = tk.BooleanVar(value=self.auto_send_enabled)
+        tk.Checkbutton(self.connection, text="Atualização automática USB", variable=self.auto_send_var, command=self.set_auto_send, bg=self.theme["card"], fg=self.theme["text"], selectcolor=self.theme["card"]).pack(anchor="w", pady=(12, 0))
+        cadence_row = tk.Frame(self.connection, bg=self.theme["card"]); cadence_row.pack(fill="x", pady=(3, 0))
+        tk.Label(cadence_row, text="Cadência USB (s)", bg=self.theme["card"], fg=self.theme["text"]).pack(side="left")
+        self.send_interval_var = tk.DoubleVar(value=self.send_interval)
+        tk.Spinbox(cadence_row, from_=MINIMUM_SEND_INTERVAL, to=300, increment=5, width=5, textvariable=self.send_interval_var, command=self.set_send_interval).pack(side="right")
+        tk.Label(self.connection, text="Desligada por padrão. O mínimo é 30 s por quadro.", wraplength=255, justify="left", bg=self.theme["card"], fg=self.theme["muted"]).pack(anchor="w", pady=(3, 0))
         if self.edit_layout: self.editor.pack(fill="x", pady=(6, 0))
         return
         root = tk.Frame(self, bg=self.theme["bg"], padx=18, pady=16)
@@ -1300,13 +1311,17 @@ class PanelApp(tk.Tk):
         self.save_alerts()
 
     def next_page(self) -> None:
-        self.page = (self.page + 1) % 3
+        self.page = normalize_page(self.page + 1)
         self.draw(force=True)
 
     def set_page(self, page: int) -> None:
         """Explicit user navigation; media polling never calls this method."""
-        self.page = page
+        self.page = normalize_page(page)
         self.last_page_change = time.monotonic()
+        self.draw(force=True)
+
+    def _draw_initial_preview(self) -> None:
+        """Populate the canvas immediately instead of waiting for a refresh tick."""
         self.draw(force=True)
 
     def on_main_window_close(self) -> None:
@@ -1454,7 +1469,11 @@ class PanelApp(tk.Tk):
         return base
 
     def layout_keys(self) -> tuple[str, ...]:
-        return ("cpu", "gpu", "ram", "disks") if self.page == 0 else ("art", "title", "artist", "state", "progress")
+        if self.page == 0:
+            return ("cpu", "gpu", "ram", "disks")
+        if self.page == 1:
+            return ("art", "title", "artist", "state", "progress")
+        return ()
 
     def draw_layout_overlay(self) -> None:
         if not getattr(self, "edit_layout", False): return
@@ -1586,8 +1605,7 @@ class PanelApp(tk.Tk):
         self.preview_photo = ImageTk.PhotoImage(self.preview_frame)
         c.create_image(0, 0, image=self.preview_photo, anchor="nw")
         self.draw_layout_overlay()
-        labels = ["Página 1 de 2 — Monitor do PC", "Página 2 de 2 — Spotify: Tocando agora"]
-        self.page_label.configure(text=labels[self.page])
+        self.page_label.configure(text=PAGE_LABELS[normalize_page(self.page)])
 
     def draw_monitor(self) -> None:
         t, m = self.theme, self.last_metrics
