@@ -45,6 +45,13 @@ from process_telemetry import ProcessSampler, ProcessRow
 from background_runtime import LatestTask
 from auto_send_policy import MINIMUM_SEND_INTERVAL, initial_auto_send, send_interval
 from page_navigation import PAGE_LABELS, normalize_page, normalize_rotation_pages
+from screen_transport import (
+    TuringScreenTransport,
+    check_display_port as _check_display_port,
+    send_frame_to_display as _send_frame_to_display,
+    send_test_frame_to_display as _send_test_frame_to_display,
+)
+from panel_models import Disk, MediaSnapshot, Metrics, Track
 
 
 RESOURCE_DIR = Path(getattr(sys, "_MEIPASS", Path(__file__).parent))
@@ -93,45 +100,6 @@ def register_private_fonts() -> None:
     for path in FONT_FILES.values():
         if path.exists():
             ctypes.windll.gdi32.AddFontResourceExW(str(path), 0x10, 0)
-
-
-@dataclass
-class Disk:
-    name: str
-    temperature: int | None
-    health: str
-    units: list[str] = field(default_factory=list)
-    usage: int | None = None
-    usage_history: list[int] = field(default_factory=list)
-    temperature_history: list[int | None] = field(default_factory=list)
-
-
-@dataclass
-class Metrics:
-    cpu_usage: int
-    cpu_temperature: int
-    gpu_usage: int
-    gpu_temperature: int
-    ram_usage: int
-    disks: list[Disk]
-
-
-@dataclass
-class Track:
-    title: str
-    artist: str
-    elapsed: int
-    duration: int
-
-
-@dataclass
-class MediaSnapshot:
-    track: Track
-    source: str
-    playing: bool
-    art_image: object | None = None
-    art_status: str = "Sem imagem publicada pelo Windows; usando placeholder."
-    playback_label: str = "tocando"
 
 
 def vlc_window_snapshot() -> MediaSnapshot | None:
@@ -526,106 +494,6 @@ class LyricsProvider:
         current = self.lines[active].text
         upcoming = self.lines[active + 1].text if active + 1 < len(self.lines) else ""
         return current, upcoming
-
-
-class TuringScreenTransport:
-    """Turing/UsbMonitor Revision A transport: 320×480 portrait, serial 115200 RTS/CTS.
-
-    It only sends frames when called explicitly; the UI never transmits by
-    default. This avoids accidental writes while the prototype is being tuned.
-    """
-    WIDTH, HEIGHT = 320, 480
-
-    def __init__(self, port: str = "COM3") -> None:
-        self.port = port
-
-    @staticmethod
-    def _pil_font(role: str, size: int):
-        from PIL import ImageFont
-        return ImageFont.truetype(str(FONT_FILES[role]), size)
-
-    @staticmethod
-    def _command(x: int, y: int, ex: int, ey: int, command: int) -> bytes:
-        return bytes((x >> 2, ((x & 3) << 6) | (y >> 4),
-                      ((y & 15) << 4) | (ex >> 6), ((ex & 63) << 2) | (ey >> 8),
-                      ey & 255, command))
-
-    def send_pil_image(self, image) -> None:
-        """Send one 320×480 portrait RGB565 frame; does not change firmware."""
-        try:
-            import serial
-        except ImportError as exc:
-            raise RuntimeError("pyserial não está disponível neste Python.") from exc
-        if image.size != (self.WIDTH, self.HEIGHT):
-            image = image.resize((self.WIDTH, self.HEIGHT))
-        rgb = image.convert("RGB")
-        pixels = bytearray()
-        for red, green, blue in rgb.getdata():
-            value = ((red & 0xF8) << 8) | ((green & 0xFC) << 3) | (blue >> 3)
-            pixels.extend((value & 0xFF, value >> 8))
-        # Revision A defines PORTRAIT as 0; the protocol encodes it as 100.
-        orientation = bytearray(16)
-        orientation[5] = 121
-        orientation[6] = 100
-        orientation[7:11] = bytes((self.WIDTH >> 8, self.WIDTH & 255,
-                                    self.HEIGHT >> 8, self.HEIGHT & 255))
-        with serial.Serial(self.port, 115200, timeout=1, write_timeout=5, rtscts=True) as device:
-            device.write(orientation)
-            device.write(self._command(0, 0, self.WIDTH - 1, self.HEIGHT - 1, 197))
-            for start in range(0, len(pixels), self.WIDTH * 8):
-                device.write(pixels[start:start + self.WIDTH * 8])
-            device.flush()
-
-    def send_test_frame(self, label: str = "CONEXAO OK") -> None:
-        """A reversible diagnostic frame, intentionally neutral and non-persistent."""
-        try:
-            from PIL import Image, ImageDraw
-        except ImportError as exc:
-            raise RuntimeError("Pillow não está disponível neste Python.") from exc
-        image = Image.new("RGB", (self.WIDTH, self.HEIGHT), "#10151f")
-        draw = ImageDraw.Draw(image)
-        draw.rectangle((18, 18, 302, 462), outline="#5b8cff", width=3)
-        draw.text((38, 140), "TELINHA", fill="#f3f6fb", font=self._pil_font("title", 25))
-        draw.text((38, 190), label, fill="#72d68b", font=self._pil_font("metric", 20))
-        draw.text((38, 238), "REVISION A / COM3", fill="#aeb8c8", font=self._pil_font("aux", 15))
-        draw.text((38, 272), "320 x 480 / RGB565", fill="#aeb8c8", font=self._pil_font("aux", 15))
-        draw.text((38, 332), "Teste reversivel - sem firmware", fill="#aeb8c8", font=self._pil_font("aux", 14))
-        self.send_pil_image(image)
-
-    def send_diagnostic_pattern(self) -> None:
-        """One frame with corner colors to visually verify byte order and orientation."""
-        try:
-            from PIL import Image, ImageDraw
-        except ImportError as exc:
-            raise RuntimeError("Pillow não está disponível neste Python.") from exc
-        image = Image.new("RGB", (self.WIDTH, self.HEIGHT), "#000000")
-        draw = ImageDraw.Draw(image)
-        # Clockwise from upper left: red, green, white, blue.
-        draw.rectangle((0, 0, 159, 239), fill="#ff0000")
-        draw.rectangle((160, 0, 319, 239), fill="#00ff00")
-        draw.rectangle((160, 240, 319, 479), fill="#ffffff")
-        draw.rectangle((0, 240, 159, 479), fill="#0000ff")
-        self.send_pil_image(image)
-
-
-def _send_frame_to_display(port: str, frame) -> str:
-    """Worker-only serial send. The caller must never run this on Tk's thread."""
-    TuringScreenTransport(port).send_pil_image(frame)
-    return f"Prévia enviada para {port}."
-
-
-def _send_test_frame_to_display(port: str) -> str:
-    """Worker-only reversible diagnostic send."""
-    TuringScreenTransport(port).send_test_frame("PAGINA DE DEMONSTRACAO")
-    return f"Teste enviado: 320 × 480 em {port}."
-
-
-def _check_display_port(port: str) -> str:
-    """Worker-only open/close check; writes no bytes to the display."""
-    import serial
-    with serial.Serial(port, 115200, timeout=1, write_timeout=1, rtscts=True):
-        pass
-    return f"{port} disponível. Envio continua manual e desligado."
 
 
 LIGHT = {"bg": "#f6f7fb", "card": "#ffffff", "text": "#182131", "muted": "#667085", "line": "#d9deea"}
