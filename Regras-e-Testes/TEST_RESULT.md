@@ -1,3 +1,3 @@
 # Resultado verificado
 
-2026-09-27: `45 passed` com Python 3.12.14 e pytest 8.x, antes do build. O empacotamento usou PyInstaller 6.22.3 já presente no ambiente do projeto.
+2026-09-27: `73 passed` em 26,19 s com Python 3.13 e pytest 8.4.2. Nenhum build, acesso a COM3, Libre Hardware Monitor ou player de mídia real foi usado nesta validação.
