@@ -18,7 +18,21 @@ Real temperature and SMART readings require Libre Hardware Monitor with `Options
 
 ### Development
 
-Run the test suite before opening a Pull Request:
+Create the environment and install the application and development dependencies:
+
+```powershell
+py -m venv .venv
+.\.venv\Scripts\pip install -r requirements.txt
+.\.venv\Scripts\pip install -r requirements-dev.txt
+```
+
+Run one test file:
+
+```powershell
+.\.venv\Scripts\python -m pytest tests\test_media_runtime.py -q
+```
+
+Run the complete test suite before opening a Pull Request:
 
 ```powershell
 .\.venv\Scripts\python -m pytest -q
@@ -50,7 +64,21 @@ Temperatura e SMART reais exigem o Libre Hardware Monitor com `Options > Web Ser
 
 ### Desenvolvimento
 
-Antes de abrir um Pull Request, rode os testes:
+Crie o ambiente e instale as dependências do aplicativo e de desenvolvimento:
+
+```powershell
+py -m venv .venv
+.\.venv\Scripts\pip install -r requirements.txt
+.\.venv\Scripts\pip install -r requirements-dev.txt
+```
+
+Para rodar apenas um arquivo de teste:
+
+```powershell
+.\.venv\Scripts\python -m pytest tests\test_media_runtime.py -q
+```
+
+Antes de abrir um Pull Request, rode toda a suíte:
 
 ```powershell
 .\.venv\Scripts\python -m pytest -q

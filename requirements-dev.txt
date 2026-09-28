@@ -1,0 +1,3 @@
+# Dependências exclusivas do desenvolvimento e da suíte automatizada.
+# Instale requirements.txt antes deste arquivo em um ambiente virtual.
+pytest==8.4.2
