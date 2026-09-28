@@ -15,7 +15,6 @@ import ctypes
 import asyncio
 import json
 import os
-import random
 import sys
 import threading
 import time
@@ -36,8 +35,6 @@ from single_instance import SingleInstance
 from visual_themes import THEME_TECHNICAL, THEME_REBEL, available_themes, layout_templates
 from rebscreen_identity import APP_NAME, header_state
 from source_icons import draw_source_icon
-from lhm_telemetry import disk_rows, query_lhm
-from disk_inventory import query_disk_inventory
 from network_telemetry import NetworkRates
 from telemetry_history import aggregate_point, rate_label
 from layout_colors import reset_item_colors, set_item_color
@@ -52,6 +49,11 @@ from screen_transport import (
     send_test_frame_to_display as _send_test_frame_to_display,
 )
 from panel_models import Disk, MediaSnapshot, Metrics, Track
+from sample_telemetry import SampleMetricsProvider, demo_screen_notice, telemetry_source_label
+
+# Compatibility name for existing integrations; values remain explicitly marked
+# as demonstration data by SampleMetricsProvider.
+DemoMetricsProvider = SampleMetricsProvider
 
 
 RESOURCE_DIR = Path(getattr(sys, "_MEIPASS", Path(__file__).parent))
@@ -403,52 +405,6 @@ class LyricLine:
     text: str
 
 
-class DemoMetricsProvider:
-    """Local usage plus all mounted Windows volumes; sensor gaps remain visible."""
-    def __init__(self):
-        self.sensor_status = "Sensores de disco: verificando Libre Hardware Monitor…"
-        self._inventory: list[dict] = []
-        self._disk_history: dict[str, dict[str, list]] = {}
-        self._sensor_snapshot: list[dict] = []
-        self._sensor_checked_at = 0.0
-
-    def disks(self) -> list[Disk]:
-        if os.name != "nt":
-            return [Disk("Armazenamento local", None, "Sensor de saúde indisponível")]
-        if not self._inventory:
-            self._inventory = query_disk_inventory()
-        volumes = [item["name"] for item in self._inventory]
-        # Starting a sensor bridge or querying a local HTTP server is much
-        # more expensive than drawing a frame. Reuse its result briefly so
-        # the Tk event loop stays responsive while the display still updates.
-        now = time.monotonic()
-        if now - self._sensor_checked_at >= 5.0:
-            self._sensor_snapshot, self.sensor_status = query_lhm()
-            self._sensor_checked_at = now
-        sensors = self._sensor_snapshot
-        sensor_by_name = {item["name"].casefold(): item for item in disk_rows(sensors, volumes)}
-        disks = []
-        for item in self._inventory[:6]:
-            sensor = sensor_by_name.get(item["name"].casefold(), {})
-            key = item["name"].casefold()
-            history = self._disk_history.setdefault(key, {"usage": [], "temperature": []})
-            usage = item.get("usage")
-            temperature = sensor.get("temperature")
-            history["usage"] = (history["usage"] + [usage if usage is not None else 0])[-30:]
-            history["temperature"] = (history["temperature"] + [temperature])[-30:]
-            disks.append(Disk(item["name"], temperature, sensor.get("health", "Indisponível"), item.get("units", []), usage, history["usage"], history["temperature"]))
-        if disks:
-            return disks
-        return [Disk(item["name"], item["temperature"], item["health"]) for item in disk_rows(sensors, volumes)[:6]]
-    def read(self) -> Metrics:
-        return Metrics(
-            cpu_usage=random.randint(18, 76), cpu_temperature=random.randint(46, 89),
-            gpu_usage=random.randint(8, 92), gpu_temperature=random.randint(42, 84),
-            ram_usage=random.randint(42, 78),
-            disks=self.disks(),
-        )
-
-
 class SpotifyDemoProvider:
     """Temporary source; later connect to Spotify Web API/desktop client."""
     def __init__(self) -> None:
@@ -601,6 +557,8 @@ class PanelFrameRenderer:
 
     def _rebel_monitor(self, draw, metrics: Metrics, history: list[int], alert: str, network: tuple[float, float]) -> None:
         cyan, cream, muted = self._rebel_frame(draw, "MONITOR")
+        if demo_screen_notice(metrics):
+            self.text(draw, (300, 54), demo_screen_notice(metrics), "aux", 6, muted, "ra")
         cards = ((20, "CPU", metrics.cpu_usage, metrics.cpu_temperature), (166, "GPU", metrics.gpu_usage, metrics.gpu_temperature))
         for x, label, usage, temp in cards:
             draw.polygon(((x,64),(x+132,64),(x+138,70),(x+138,151),(x,151)), fill="#202829", outline=cyan)
@@ -700,6 +658,8 @@ class PanelFrameRenderer:
         self.text(draw, (22, 22), "REBSCREEN | MONITOR", "aux", 10, cyan)
         self.text(draw, (298, 20), clock, "metric", 16, white, "ra")
         self.text(draw, (298, 39), date, "aux", 8, muted, "ra")
+        if demo_screen_notice(metrics):
+            self.text(draw, (22, 39), demo_screen_notice(metrics), "aux", 7, muted)
         self.text(draw, (22, 52), "◉ CPU", "aux", 14, muted)
         self.text(draw, (112, 42), f"{metrics.cpu_usage:02d}%", "metric", 34, white)
         self.text(draw, (226, 50), f"{metrics.cpu_temperature}°C", "aux", 13, cyan)
@@ -859,7 +819,7 @@ class PanelApp(tk.Tk):
         self.minsize(980, 640)
         self.settings = SettingsStore()
         self.geometry(self.settings.data["geometry"])
-        self.metrics_provider = DemoMetricsProvider()
+        self.metrics_provider = SampleMetricsProvider()
         self.spotify_provider = SpotifyDemoProvider()
         self.media_provider = WindowsMediaProvider()
         self.layout_store = LayoutStore()
@@ -1521,14 +1481,14 @@ class PanelApp(tk.Tk):
     def update_alerts(self) -> None:
         m = self.last_metrics
         found: list[str] = []
-        if self.enabled["CPU"] and m.cpu_temperature >= self.limits["CPU"]:
+        if "CPU" not in m.demo_components and self.enabled["CPU"] and m.cpu_temperature >= self.limits["CPU"]:
             found.append(f"ALERTA CPU: {m.cpu_temperature} °C • limite {self.limits['CPU']} °C")
-        if self.enabled["GPU"] and m.gpu_temperature >= self.limits["GPU"]:
+        if "GPU" not in m.demo_components and self.enabled["GPU"] and m.gpu_temperature >= self.limits["GPU"]:
             found.append(f"ALERTA GPU: {m.gpu_temperature} °C • limite {self.limits['GPU']} °C")
         for d in m.disks:
             if self.enabled["Discos"] and d.temperature is not None and d.temperature >= self.limits["Discos"]:
                 found.append(f"ALERTA {d.name}: {d.temperature} °C • limite {self.limits['Discos']} °C")
-        if self.enabled["RAM"] and m.ram_usage >= self.limits["RAM"]:
+        if "RAM" not in m.demo_components and self.enabled["RAM"] and m.ram_usage >= self.limits["RAM"]:
             found.append(f"ALERTA RAM: {m.ram_usage}% em uso • limite {self.limits['RAM']}%")
         if found != self.alerts:
             self.alerts = found
@@ -1599,7 +1559,7 @@ class PanelApp(tk.Tk):
     def _apply_metrics(self, metrics, now: float) -> None:
         self.last_metrics = metrics
         if hasattr(self, "sensor_status"):
-            self.sensor_status.configure(text="Sensores de disco: " + self.metrics_provider.sensor_status, fg=self.theme["muted"])
+            self.sensor_status.configure(text=telemetry_source_label(metrics) + "\n" + self.metrics_provider.sensor_status, fg=self.theme["muted"])
         self.cpu_history = (self.cpu_history + [metrics.cpu_usage])[-60:]
         system_temperatures = [metrics.cpu_temperature, metrics.gpu_temperature]
         disk_temperatures = [disk.temperature for disk in metrics.disks]

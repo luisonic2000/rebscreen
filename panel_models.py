@@ -23,6 +23,7 @@ class Metrics:
     gpu_temperature: int
     ram_usage: int
     disks: list[Disk]
+    demo_components: frozenset[str] = field(default_factory=frozenset)
 
 
 @dataclass
