@@ -19,4 +19,4 @@ Suíte completa:
 .\.venv\Scripts\python.exe -m pytest -q
 ```
 
-Os testes não acessam Spotify, VLC, GSMTC, Libre Hardware Monitor ou COM3. O laboratório controlado usa provedores falsos para mídia, sensores e serial, porém executa os métodos reais do Rebscreen para validar: consulta de mídia lenta fora da interface, aplicação de mídia concluída, atualização da prévia e codificação de um quadro RGB565 completo.
+Os testes não acessam Spotify, VLC, GSMTC, Libre Hardware Monitor ou COM3. O laboratório controlado usa provedores falsos para mídia, sensores e serial, porém executa os métodos reais do Rebscreen para validar: consulta de mídia lenta fora da interface, aplicação de mídia concluída, atualização da prévia, codificação de um quadro RGB565 completo, consultas de telemetria lentas e bloqueio de envios seriais sobrepostos.

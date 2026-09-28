@@ -42,6 +42,7 @@ from network_telemetry import NetworkRates
 from telemetry_history import aggregate_point, rate_label
 from layout_colors import reset_item_colors, set_item_color
 from process_telemetry import ProcessSampler, ProcessRow
+from background_runtime import LatestTask
 
 
 RESOURCE_DIR = Path(getattr(sys, "_MEIPASS", Path(__file__).parent))
@@ -605,6 +606,26 @@ class TuringScreenTransport:
         self.send_pil_image(image)
 
 
+def _send_frame_to_display(port: str, frame) -> str:
+    """Worker-only serial send. The caller must never run this on Tk's thread."""
+    TuringScreenTransport(port).send_pil_image(frame)
+    return f"Prévia enviada para {port}."
+
+
+def _send_test_frame_to_display(port: str) -> str:
+    """Worker-only reversible diagnostic send."""
+    TuringScreenTransport(port).send_test_frame("PAGINA DE DEMONSTRACAO")
+    return f"Teste enviado: 320 × 480 em {port}."
+
+
+def _check_display_port(port: str) -> str:
+    """Worker-only open/close check; writes no bytes to the display."""
+    import serial
+    with serial.Serial(port, 115200, timeout=1, write_timeout=1, rtscts=True):
+        pass
+    return f"{port} disponível. Envio continua manual e desligado."
+
+
 LIGHT = {"bg": "#f6f7fb", "card": "#ffffff", "text": "#182131", "muted": "#667085", "line": "#d9deea"}
 DARK = {"bg": "#10151f", "card": "#1b2330", "text": "#f3f6fb", "muted": "#aeb8c8", "line": "#334054"}
 
@@ -973,7 +994,12 @@ class PanelApp(tk.Tk):
         self.media_provider = WindowsMediaProvider()
         self.layout_store = LayoutStore()
         self.process_sampler = ProcessSampler()
-        self.processes: list[ProcessRow] = self.process_sampler.read()
+        self.runtime_executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix="rebscreen-runtime")
+        self.metrics_task = LatestTask(self.runtime_executor)
+        self.process_task = LatestTask(self.runtime_executor)
+        self.network_task = LatestTask(self.runtime_executor)
+        self.serial_task = LatestTask(self.runtime_executor)
+        self.processes: list[ProcessRow] = []
         self.page = 0
         self.dark = bool(self.settings.data["dark"])
         self.accent = self.settings.data["accent"]
@@ -1009,11 +1035,13 @@ class PanelApp(tk.Tk):
         self.alerts: list[str] = []
         self.alert_cycle = cycle([""])
         self.current_alert = ""
-        self.last_metrics = self.metrics_provider.read()
+        # Start with a neutral frame. Slow sensors are requested after Tk is
+        # ready, so opening the window never waits on PowerShell or LHM.
+        self.last_metrics = Metrics(0, 0, 0, 0, 0, [])
         self.cpu_history: list[int] = [self.last_metrics.cpu_usage]
         self.telemetry_history: list[dict] = [aggregate_point(self.last_metrics.cpu_usage, self.last_metrics.gpu_usage, self.last_metrics.ram_usage, [self.last_metrics.cpu_temperature, self.last_metrics.gpu_temperature], [disk.temperature for disk in self.last_metrics.disks])]
         self.network_rates = NetworkRates()
-        self.rx_rate, self.tx_rate = self.network_rates.read()
+        self.rx_rate, self.tx_rate = 0.0, 0.0
         self.preview_static_frame = None
         self.track = Track("Nenhuma mídia ativa", "Inicie Spotify ou outro player compatível", 0, 1)
         self.media_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="telinha-media")
@@ -1022,6 +1050,7 @@ class PanelApp(tk.Tk):
         self.media_query_timed_out = False
         self.last_media_key: tuple[object, ...] | None = None
         self.last_metrics_update = 0.0
+        self.last_metrics_request = 0.0
         self.tray_icon = None
         self.protocol("WM_DELETE_WINDOW", self.on_main_window_close)
         self._build_ui()
@@ -1345,6 +1374,7 @@ class PanelApp(tk.Tk):
         if self.tray_icon is not None:
             self.tray_icon.stop()
         self.media_executor.shutdown(wait=False, cancel_futures=True)
+        self.runtime_executor.shutdown(wait=False, cancel_futures=True)
         self.single_instance.close()
         self.destroy()
 
@@ -1504,22 +1534,12 @@ class PanelApp(tk.Tk):
 
     def send_screen_test(self) -> None:
         """User-initiated only: write the neutral reversible test frame once."""
-        try:
-            TuringScreenTransport(self.port_var.get().strip()).send_test_frame("PAGINA DE DEMONSTRACAO")
-            self.hardware_status.configure(text="Teste enviado: 320 × 480 em " + self.port_var.get(), fg="#3fae68")
-        except Exception as exc:
-            self.hardware_status.configure(text=explain_serial_error(exc), fg="#ef5350")
+        self._queue_serial_operation(_send_test_frame_to_display, "Teste sendo enviado em segundo plano.", self.port_var.get().strip())
 
     def check_port_status(self) -> None:
         """A manual open/close check; it sends no bytes and leaves no stream open."""
         port = self.port_var.get().strip()
-        try:
-            import serial
-            with serial.Serial(port, 115200, timeout=1, write_timeout=1, rtscts=True):
-                pass
-            self.hardware_status.configure(text=f"{port} disponível. Envio continua manual e desligado.", fg="#3fae68")
-        except Exception as exc:
-            self.hardware_status.configure(text=explain_serial_error(exc), fg="#ef5350")
+        self._queue_serial_operation(_check_display_port, "Verificando porta em segundo plano.", port)
 
     def render_live_frame(self):
         """The live frame is for the physical display, never the static preview."""
@@ -1543,11 +1563,7 @@ class PanelApp(tk.Tk):
         if self.preview_orientation != "vertical":
             self.hardware_status.configure(text="Envio físico bloqueado: valide primeiro a orientação vertical do protocolo.", fg="#ef9b3e")
             return
-        try:
-            TuringScreenTransport(self.port_var.get().strip()).send_pil_image(self.render_live_frame())
-            self.hardware_status.configure(text="Previa enviada com sucesso.", fg="#3fae68")
-        except Exception as exc:
-            self.hardware_status.configure(text=explain_serial_error(exc), fg="#ef5350")
+        self._queue_serial_operation(_send_frame_to_display, "Prévia sendo enviada em segundo plano.", self.port_var.get().strip(), self.render_live_frame())
 
     def _rebuild(self) -> None:
         for child in self.winfo_children(): child.destroy()
@@ -1682,21 +1698,61 @@ class PanelApp(tk.Tk):
         """Queue a safe inspection; normal synchronization is already automatic."""
         self.poll_media()
 
+    def _queue_serial_operation(self, operation, status: str, *operation_args) -> bool:
+        """Queue one serial operation and reject overlaps without blocking Tk."""
+        if not self.serial_task.start(operation, *operation_args):
+            self.hardware_status.configure(text="Uma operação USB já está em andamento.", fg=self.theme["muted"])
+            return False
+        self.hardware_status.configure(text=status, fg=self.theme["muted"])
+        return True
+
+    def _apply_metrics(self, metrics, now: float) -> None:
+        self.last_metrics = metrics
+        if hasattr(self, "sensor_status"):
+            self.sensor_status.configure(text="Sensores de disco: " + self.metrics_provider.sensor_status, fg=self.theme["muted"])
+        self.cpu_history = (self.cpu_history + [metrics.cpu_usage])[-60:]
+        system_temperatures = [metrics.cpu_temperature, metrics.gpu_temperature]
+        disk_temperatures = [disk.temperature for disk in metrics.disks]
+        point = aggregate_point(metrics.cpu_usage, metrics.gpu_usage, metrics.ram_usage, system_temperatures, disk_temperatures)
+        self.telemetry_history = (self.telemetry_history + [point])[-60:]
+        self.last_metrics_update = now
+        self.update_alerts()
+
+    def _poll_background_results(self, now: float) -> None:
+        """Apply completed work on Tk's thread; never wait for a worker here."""
+        metrics = self.metrics_task.take_completed()
+        if metrics is not None:
+            if metrics.error is None:
+                self._apply_metrics(metrics.result, now)
+            elif hasattr(self, "sensor_status"):
+                self.sensor_status.configure(text="Sensores indisponíveis: " + str(metrics.error), fg="#ef5350")
+        processes = self.process_task.take_completed()
+        if processes is not None and processes.error is None:
+            self.processes = processes.result
+        network = self.network_task.take_completed()
+        if network is not None and network.error is None:
+            self.rx_rate, self.tx_rate = network.result
+        serial = self.serial_task.take_completed()
+        if serial is not None:
+            if serial.error is None:
+                self.hardware_status.configure(text=serial.result, fg="#3fae68")
+            else:
+                self.hardware_status.configure(text=explain_serial_error(serial.error), fg="#ef5350")
+
+    def _request_background_telemetry(self, now: float) -> None:
+        """Request the next samples only when the previous request was consumed."""
+        if now - self.last_metrics_request < 2.0:
+            return
+        started = self.metrics_task.start(self.metrics_provider.read)
+        self.process_task.start(self.process_sampler.read)
+        self.network_task.start(self.network_rates.read)
+        if started:
+            self.last_metrics_request = now
+
     def refresh(self) -> None:
         now = time.monotonic()
-        metrics_changed = now - self.last_metrics_update >= 2.0
-        if metrics_changed:
-            self.last_metrics = self.metrics_provider.read()
-            if hasattr(self, "sensor_status"):
-                self.sensor_status.configure(text="Sensores de disco: " + self.metrics_provider.sensor_status, fg=self.theme["muted"])
-            self.cpu_history = (self.cpu_history + [self.last_metrics.cpu_usage])[-60:]
-            system_temperatures = [self.last_metrics.cpu_temperature, self.last_metrics.gpu_temperature]
-            disk_temperatures = [disk.temperature for disk in self.last_metrics.disks]
-            self.telemetry_history = (self.telemetry_history + [aggregate_point(self.last_metrics.cpu_usage, self.last_metrics.gpu_usage, self.last_metrics.ram_usage, system_temperatures, disk_temperatures)])[-60:]
-            self.rx_rate, self.tx_rate = self.network_rates.read()
-            self.processes = self.process_sampler.read()
-            self.last_metrics_update = now
-            self.update_alerts()
+        self._poll_background_results(now)
+        self._request_background_telemetry(now)
         media_changed = self.poll_media()
         # The app preview is deliberately static and cosmetic.  Live data is
         # still rendered below for the physical display.
@@ -1705,18 +1761,8 @@ class PanelApp(tk.Tk):
             self.last_page_change = now
             self.draw(force=True)
         if self.auto_send_enabled and self.preview_orientation == "vertical" and now - self.last_auto_send >= self.send_interval:
-            try:
-                import serial.tools.list_ports
-                port = self.port_var.get().strip()
-                detected = {item.device.upper() for item in serial.tools.list_ports.comports()}
-                if port.upper() not in detected:
-                    self.hardware_status.configure(text=f"Aguardando tela compatível em {port}; nenhum envio foi feito.", fg=self.theme["muted"])
-                else:
-                    TuringScreenTransport(port).send_pil_image(self.render_live_frame())
-                    self.last_auto_send = now
-                    self.hardware_status.configure(text="Tela conectada: atualização enviada a cada 1 s.", fg="#3fae68")
-            except Exception as exc:
-                self.hardware_status.configure(text="Envio aguardando disponibilidade: " + explain_serial_error(exc), fg="#ef5350")
+            if self._queue_serial_operation(_send_frame_to_display, "Atualização da tela em segundo plano.", self.port_var.get().strip(), self.render_live_frame()):
+                self.last_auto_send = now
         self.after(1000, self.refresh)
 
 
